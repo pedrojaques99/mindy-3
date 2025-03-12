@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { supabase, checkSupabaseConnection } from '../main';
+import supabase, { checkSupabaseConnection } from '../utils/supabase';
 import { useLanguage } from '../context/LanguageContext';
 import { setupDatabase } from '../utils/setupDatabase';
 import toast from 'react-hot-toast';
@@ -14,7 +14,16 @@ const TestPage = () => {
   const [directQueryResult, setDirectQueryResult] = useState(null);
 
   useEffect(() => {
-    checkConnection();
+    // Only check connection if Supabase mode is forced
+    const forceSupabase = localStorage.getItem('forceSupabaseConnection') === 'true';
+    
+    if (forceSupabase) {
+      checkConnection();
+    } else {
+      setConnectionStatus('Disabled');
+      setTranslationsStatus('Disabled');
+      addTestResult('Connection mode', 'Info', 'Connection checks disabled for performance. Enable Supabase mode to test.');
+    }
     
     // Get Supabase URL from environment
     const url = import.meta.env.VITE_SUPABASE_URL || 'Not available';
@@ -27,39 +36,80 @@ const TestPage = () => {
       setConnectionStatus('Checking...');
       
       // Check Supabase connection using the centralized function
-      const connectionResult = await checkSupabaseConnection();
+      const isConnected = await checkSupabaseConnection(true); // Force a fresh check
       
-      if (connectionResult && connectionResult.success) {
+      if (isConnected) {
         setConnectionStatus('Connected');
-        addTestResult('Database connection', 'Success', `Connected to Supabase (${connectionResult.responseTime}ms)`);
+        addTestResult('Database connection', 'Success', 'Connected to Supabase');
       } else {
         setConnectionStatus('Disconnected');
-        const errorMessage = connectionResult?.error?.message || 'Could not connect to Supabase';
-        addTestResult('Database connection', 'Failed', errorMessage);
+        addTestResult('Database connection', 'Failed', 'Could not connect to Supabase');
         setIsLoading(false);
         return;
       }
       
-      // Check translations
-      const { data, error } = await supabase
-        .from('translations')
-        .select('*')
-        .limit(5);
+      // Check if we have cached translation status to avoid unnecessary queries
+      const cachedTranslationsStatus = localStorage.getItem('translationsStatus');
+      const cachedTranslationsTime = localStorage.getItem('translationsStatusTime');
+      const now = Date.now();
+      
+      // Use cached status if it's less than 5 minutes old
+      if (cachedTranslationsStatus && cachedTranslationsTime && 
+          (now - parseInt(cachedTranslationsTime)) < 5 * 60 * 1000) {
         
-      if (error) {
-        if (error.code === '42P01') {
-          setTranslationsStatus('Not Created');
-          addTestResult('Translations table', 'Warning', 'Table does not exist yet. Use "Setup Database" to create it.');
-        } else {
-          setTranslationsStatus('Error');
-          addTestResult('Translations table', 'Failed', error.message);
-        }
-      } else if (!data || data.length === 0) {
-        setTranslationsStatus('Empty');
-        addTestResult('Translations table', 'Warning', 'No translations found. Use "Setup Database" to add translations.');
+        console.log('Using cached translations status');
+        const translationsData = JSON.parse(cachedTranslationsStatus);
+        
+        setTranslationsStatus(translationsData.status);
+        addTestResult('Translations table', translationsData.result, translationsData.message);
       } else {
-        setTranslationsStatus('Available');
-        addTestResult('Translations table', 'Success', `Found ${data.length} translations`);
+        // Check translations
+        const { data, error } = await supabase
+          .from('translations')
+          .select('*')
+          .limit(5);
+          
+        let statusData = {};
+        
+        if (error) {
+          if (error.code === '42P01') {
+            setTranslationsStatus('Not Created');
+            statusData = {
+              status: 'Not Created',
+              result: 'Warning',
+              message: 'Table does not exist yet. Use "Setup Database" to create it.'
+            };
+            addTestResult('Translations table', 'Warning', 'Table does not exist yet. Use "Setup Database" to create it.');
+          } else {
+            setTranslationsStatus('Error');
+            statusData = {
+              status: 'Error',
+              result: 'Failed',
+              message: error.message
+            };
+            addTestResult('Translations table', 'Failed', error.message);
+          }
+        } else if (!data || data.length === 0) {
+          setTranslationsStatus('Empty');
+          statusData = {
+            status: 'Empty',
+            result: 'Warning',
+            message: 'No translations found. Use "Setup Database" to add translations.'
+          };
+          addTestResult('Translations table', 'Warning', 'No translations found. Use "Setup Database" to add translations.');
+        } else {
+          setTranslationsStatus('Available');
+          statusData = {
+            status: 'Available',
+            result: 'Success',
+            message: `Found ${data.length} translations`
+          };
+          addTestResult('Translations table', 'Success', `Found ${data.length} translations`);
+        }
+        
+        // Cache the translations status
+        localStorage.setItem('translationsStatus', JSON.stringify(statusData));
+        localStorage.setItem('translationsStatusTime', now.toString());
       }
     } catch (error) {
       console.error('Error checking connection:', error);
@@ -149,13 +199,53 @@ const TestPage = () => {
     return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
   };
 
+  // Toggle Supabase connection mode
+  const toggleSupabaseMode = () => {
+    const currentMode = localStorage.getItem('forceSupabaseConnection') === 'true';
+    const newMode = !currentMode;
+    
+    localStorage.setItem('forceSupabaseConnection', newMode.toString());
+    
+    if (newMode) {
+      toast.success('Supabase mode enabled. The app will use live data.');
+      checkConnection();
+    } else {
+      toast.success('Local data mode enabled. Connection checks disabled for performance.');
+      setConnectionStatus('Disabled');
+      setTranslationsStatus('Disabled');
+      addTestResult('Connection mode', 'Info', 'Connection checks disabled for performance. Enable Supabase mode to test.');
+    }
+  };
+
   return (
     <div className="container mx-auto px-4 py-8">
       <h1 className="text-3xl font-bold mb-6 text-white">Database & Translation Test</h1>
       
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-8">
         <div className="bg-dark-200 rounded-xl p-6 border border-dark-300">
-          <h2 className="text-xl font-semibold mb-4 text-white">Connection Status</h2>
+          <div className="flex justify-between items-center mb-4">
+            <h2 className="text-xl font-semibold text-white">Connection Status</h2>
+            
+            <button 
+              onClick={toggleSupabaseMode}
+              className={`flex items-center px-3 py-1 rounded-md text-xs transition-colors ${
+                localStorage.getItem('forceSupabaseConnection') === 'true'
+                  ? 'bg-lime-accent/20 text-lime-accent hover:bg-lime-accent/30'
+                  : 'bg-dark-300 text-white/70 hover:bg-dark-400'
+              }`}
+            >
+              <span className="mr-2">
+                {localStorage.getItem('forceSupabaseConnection') === 'true'
+                  ? 'Using Supabase'
+                  : 'Using Local Data'}
+              </span>
+              <span className={`w-2 h-2 rounded-full ${
+                localStorage.getItem('forceSupabaseConnection') === 'true'
+                  ? 'bg-lime-accent'
+                  : 'bg-white/30'
+              }`}></span>
+            </button>
+          </div>
           
           <div className="mb-4">
             <p className="text-gray-400 mb-2">Supabase URL:</p>

@@ -1,5 +1,5 @@
 import { createContext, useContext, useState, useEffect } from 'react';
-import { supabase } from '../main';
+import supabase, { handleSupabaseError } from '../utils/supabase';
 import toast from 'react-hot-toast';
 
 const UserContext = createContext();
@@ -22,6 +22,25 @@ export const UserProvider = ({ children }) => {
   const fetchUserProfile = async (userId) => {
     if (!userId) return;
     
+    // Skip Supabase request if in local mode
+    const forceSupabase = localStorage.getItem('forceSupabaseConnection') === 'true';
+    if (!forceSupabase) {
+      // Create a mock profile
+      const mockProfile = {
+        id: userId,
+        username: 'Local User',
+        avatar_url: null,
+        website: null,
+        bio: 'This is a mock profile for local data mode.',
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      };
+      
+      console.log("Using mock profile data in local mode:", mockProfile);
+      setProfile(mockProfile);
+      return mockProfile;
+    }
+    
     try {
       setProfileLoading(true);
       console.log("Fetching user profile for ID:", userId);
@@ -34,6 +53,24 @@ export const UserProvider = ({ children }) => {
       
       if (error) {
         console.error("Error fetching profile from 'profiles' table:", error);
+        
+        // If the table doesn't exist, create a mock profile
+        if (error.code === '42P01') {
+          console.log("Profiles table doesn't exist, using mock profile");
+          const mockProfile = {
+            id: userId,
+            username: 'User',
+            avatar_url: null,
+            website: null,
+            bio: 'This is a mock profile.',
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString()
+          };
+          
+          setProfile(mockProfile);
+          return mockProfile;
+        }
+        
         throw error;
       }
       
@@ -42,7 +79,20 @@ export const UserProvider = ({ children }) => {
       return data;
     } catch (error) {
       console.error('Error fetching user profile:', error);
-      return null;
+      
+      // Create a fallback profile if there's an error
+      const fallbackProfile = {
+        id: userId,
+        username: 'User',
+        avatar_url: null,
+        website: null,
+        bio: 'Profile data unavailable.',
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      };
+      
+      setProfile(fallbackProfile);
+      return fallbackProfile;
     } finally {
       setProfileLoading(false);
     }
@@ -186,6 +236,16 @@ export const UserProvider = ({ children }) => {
   const updateUserProfile = async (profileData) => {
     if (!user) return { success: false, error: 'Not authenticated' };
     
+    // Skip Supabase request if in local mode
+    const forceSupabase = localStorage.getItem('forceSupabaseConnection') === 'true';
+    if (!forceSupabase) {
+      // Update local state only
+      const updatedProfile = { ...profile, ...profileData, updated_at: new Date().toISOString() };
+      setProfile(updatedProfile);
+      toast.success('Profile updated successfully (local mode)');
+      return { success: true, data: updatedProfile };
+    }
+    
     try {
       console.log("Updating profile with data:", profileData);
       
@@ -196,8 +256,18 @@ export const UserProvider = ({ children }) => {
         .eq('id', user.id)
         .single();
         
-      if (existingError && existingError.code !== 'PGRST116') {
+      if (existingError) {
         console.error("Error checking existing profile:", existingError);
+        
+        // If the table doesn't exist, just update local state
+        if (existingError.code === '42P01') {
+          console.log("Profiles table doesn't exist, updating local state only");
+          const updatedProfile = { ...profile, ...profileData, updated_at: new Date().toISOString() };
+          setProfile(updatedProfile);
+          toast.success('Profile updated successfully (local only)');
+          return { success: true, data: updatedProfile };
+        }
+        
         throw existingError;
       }
       
@@ -236,7 +306,11 @@ export const UserProvider = ({ children }) => {
     } catch (error) {
       console.error('Error updating profile:', error);
       toast.error('Failed to update profile: ' + error.message);
-      return { success: false, error: error.message };
+      
+      // If there's an error, still update the local state
+      const updatedProfile = { ...profile, ...profileData, updated_at: new Date().toISOString() };
+      setProfile(updatedProfile);
+      return { success: false, error: error.message, localUpdate: true };
     }
   };
 

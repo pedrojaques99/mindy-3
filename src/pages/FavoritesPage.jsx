@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { supabase } from '../main';
+import supabase from '../utils/supabase';
 import { useUser } from '../context/UserContext';
 import ResourceCard from '../components/ResourceCard';
 import toast from 'react-hot-toast';

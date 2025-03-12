@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { SearchIcon, XIcon } from '@heroicons/react/outline';
 import { motion, AnimatePresence } from 'framer-motion';
-import { supabase } from '../main';
+import supabase from '../utils/supabase';
 import { useUser } from '../context/UserContext';
 import { useResources } from '../context/ResourcesContext';
 import { Link } from 'react-router-dom';

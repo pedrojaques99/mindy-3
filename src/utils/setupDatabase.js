@@ -1,4 +1,4 @@
-import { supabase, checkSupabaseConnection } from '../main';
+import supabase, { checkSupabaseConnection } from './supabase';
 
 // Create an RPC function for getting tables if it doesn't exist
 // This is a helper function that will be called when the app starts
@@ -36,10 +36,10 @@ export const setupDatabase = async () => {
     console.log('Setting up database...');
     
     // First, check if we have a working connection to the Supabase server
-    const connectionResult = await checkSupabaseConnection();
+    const isConnected = await checkSupabaseConnection(true); // Force a fresh check
     
-    if (!connectionResult.success) {
-      console.error('Cannot connect to Supabase:', connectionResult.error);
+    if (!isConnected) {
+      console.error('Cannot connect to Supabase');
       return false;
     }
     
@@ -47,55 +47,6 @@ export const setupDatabase = async () => {
     
     // Try to create our diagnostic utilities
     await createGetTablesFunction();
-    
-    // Try to create health_check table if it doesn't exist
-    try {
-      // First, try creating the health_check table if it doesn't exist
-      const { error: createTableError } = await supabase.rpc('create_health_check_table', {}, {
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json'
-        }
-      });
-      
-      if (createTableError) {
-        console.warn('Failed to create health_check table via RPC:', createTableError);
-        
-        // We can't directly create tables from the client side with standard permissions
-        // Let's make our code resilient to this case
-        console.warn('Cannot create health_check table. This needs to be done via migration or by a DB admin.');
-      }
-      
-      // Now try to insert or update the health check entry
-      const { error: healthError } = await supabase
-        .from('health_check')
-        .upsert(
-          [{ id: 1, status: 'ok', message: 'Health check created', created_at: new Date().toISOString() }],
-          { 
-            headers: { 
-              'Content-Type': 'application/json',
-              'Accept': 'application/json'
-            },
-            onConflict: 'id'
-          }
-        );
-        
-      if (healthError) {
-        console.error('Health check table operation failed:', healthError);
-        
-        if (healthError.code === '42P01') {
-          console.log('Health check table does not exist. This is expected on first run.');
-        } else {
-          // Don't fail entirely just because health check table failed
-          console.warn('Will continue with setup despite health check error');
-        }
-      } else {
-        console.log('Health check table operation successful');
-      }
-    } catch (healthError) {
-      console.error('Cannot create health_check table:', healthError);
-      // Continue despite this error - this is not fatal
-    }
     
     // Insert translations
     try {
@@ -183,18 +134,17 @@ export const setupDatabase = async () => {
   }
 };
 
-// Function to check if the database is set up
+// Check if database is properly set up
 export const checkDatabaseSetup = async () => {
   try {
-    // First check if we can connect at all
-    const connectionResult = await checkSupabaseConnection();
-    if (!connectionResult.success) {
-      console.error('Cannot connect to Supabase:', connectionResult.error);
+    if (typeof window === 'undefined' || typeof document === 'undefined') {
+      console.log('Not in browser environment, skipping database setup check');
       return false;
     }
     
-    // Let's try to get a list of all tables in public schema
-    // This is useful for diagnostics before we try to access specific tables
+    console.log('Checking database setup...');
+    
+    // Try to list tables using get_tables RPC function
     try {
       // This uses pg_catalog to check table existence - should work with public access
       const { data: tables, error: tablesError } = await supabase
@@ -204,15 +154,17 @@ export const checkDatabaseSetup = async () => {
       if (!tablesError && tables) {
         console.log('Available tables in schema:', tables);
       } else {
-        console.log('Could not get table list:', tablesError);
+        console.log('Could not get table list using RPC:', tablesError);
+        // Instead of failing, we'll try direct table checks below
       }
     } catch (error) {
-      console.log('Table listing not supported with current permissions');
+      console.log('Table listing not supported with current permissions or RPC function missing. Will check tables directly.');
+      // Continue to direct table check
     }
     
     // Try multiple tables in sequence - we consider the DB set up if ANY of them exist
     // This makes our app more resilient to different database configurations
-    const tablesToCheck = ['health_check', 'profiles', 'resources'];
+    const tablesToCheck = ['resources', 'translations', 'favorites', 'comments', 'profiles'];
     let anyTableExists = false;
     
     for (const table of tablesToCheck) {
@@ -228,28 +180,24 @@ export const checkDatabaseSetup = async () => {
           continue;
         }
         
-        // Any other error means we couldn't query properly
+        // Other errors - log but don't fail
         if (error) {
-          console.warn(`Error checking ${table} table:`, error);
+          console.error(`Error checking ${table} table:`, error);
           continue;
         }
         
-        // If we get here, the table exists and is queryable
-        console.log(`Table check: ${table} exists and is accessible`);
+        // If we got this far, table exists
+        console.log(`Table check: ${table} exists`);
         anyTableExists = true;
         break;
-      } catch (error) {
-        console.warn(`Exception checking ${table} table:`, error);
+      } catch (tableError) {
+        console.error(`Exception checking ${table} table:`, tableError);
+        continue;
       }
     }
     
-    if (anyTableExists) {
-      console.log('Database is set up: at least one required table exists');
-      return true;
-    }
-    
-    console.log('Database not set up: no required tables exist or are accessible');
-    return false;
+    // Return true if any table exists
+    return anyTableExists;
   } catch (error) {
     console.error('Error checking database setup:', error);
     return false;

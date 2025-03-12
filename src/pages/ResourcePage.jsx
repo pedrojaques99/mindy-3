@@ -1,20 +1,17 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
+import { v4 as uuidv4 } from 'uuid';
 import { 
   ArrowLeftIcon, 
   ExternalLinkIcon, 
   HeartIcon, 
   ShareIcon,
-  ClockIcon,
-  UserIcon,
-  ThumbUpIcon,
-  ChatIcon,
   TagIcon,
-  ChatAltIcon,
   RefreshIcon
 } from '@heroicons/react/outline';
 import { HeartIcon as HeartSolidIcon } from '@heroicons/react/solid';
-import { supabase } from '../main';
+import supabase, { executeWithRetry, handleSupabaseError } from '../utils/supabase';
+import { optimizedRequest } from '../utils/requestManager';
 import { useUser } from '../context/UserContext';
 import { useLanguage } from '../context/LanguageContext';
 import SoftwareIcon from '../components/ui/SoftwareIcon';
@@ -24,9 +21,69 @@ import RelatedResources from '../components/RelatedResources';
 import toast from 'react-hot-toast';
 import { Helmet } from 'react-helmet-async';
 import { getResourceThumbnails } from '../utils/thumbnailUtils';
-import { getResourceById, trackResourceView, toggleFavorite, checkAuthStatus } from '../utils/resourceUtils';
+import { getResourceById, trackResourceView, toggleFavorite as toggleFavoriteUtil, checkAuthStatus } from '../utils/resourceUtils';
+import { formatDistanceToNow } from 'date-fns';
+import { motion } from 'framer-motion';
 
-export default function ResourcePage() {
+// Validate resource ID format (UUID)
+const isValidResourceId = (id) => {
+  if (!id) return false;
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  return uuidRegex.test(id);
+};
+
+// Generate mock resource for local mode
+const generateMockResource = (id) => {
+  return {
+    id: id || uuidv4(),
+    title: 'Sample Resource',
+    description: 'This is a sample resource generated in local mode. The actual resource data could not be fetched.',
+    url: 'https://example.com',
+    thumbnail_url: 'https://via.placeholder.com/300x200?text=Sample+Resource',
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    user_id: 'mock-user',
+    category: 'Development',
+    subcategory: 'Web Development',
+    tags: ['sample', 'mock', 'local'],
+    likes_count: 5,
+    views_count: 10,
+    user: {
+      username: 'LocalUser',
+      avatar_url: null
+    }
+  };
+};
+
+// Resource cache to reduce database load
+const resourceCache = {
+  data: {},
+  timestamp: {},
+  ttl: 5 * 60 * 1000, // 5 minute cache TTL
+  
+  // Get resource from cache if available and not expired
+  get(resourceId) {
+    const now = Date.now();
+    if (this.data[resourceId] && now - this.timestamp[resourceId] < this.ttl) {
+      return this.data[resourceId];
+    }
+    return null;
+  },
+  
+  // Store resource in cache
+  set(resourceId, resource) {
+    this.data[resourceId] = resource;
+    this.timestamp[resourceId] = Date.now();
+  },
+  
+  // Clear cache for a specific resource
+  clear(resourceId) {
+    delete this.data[resourceId];
+    delete this.timestamp[resourceId];
+  }
+};
+
+const ResourcePage = () => {
   const { id } = useParams();
   const { user } = useUser();
   const { t } = useLanguage();
@@ -45,6 +102,27 @@ export default function ResourcePage() {
   const [isLoadingComments, setIsLoadingComments] = useState(false);
   const [error, setError] = useState(null);
 
+  // Animation variants for elements
+  const fadeIn = {
+    hidden: { opacity: 0 },
+    visible: { opacity: 1, transition: { duration: 0.4 } }
+  };
+  
+  const slideUp = {
+    hidden: { opacity: 0, y: 20 },
+    visible: { opacity: 1, y: 0, transition: { duration: 0.5 } }
+  };
+  
+  const staggerChildren = {
+    hidden: { opacity: 0 },
+    visible: {
+      opacity: 1,
+      transition: {
+        staggerChildren: 0.1
+      }
+    }
+  };
+
   // Set initial page title
   useEffect(() => {
     document.title = `${t('resource.viewingResource')} | Mindy`;
@@ -59,9 +137,8 @@ export default function ResourcePage() {
   
   // Check for tab in URL
   useEffect(() => {
-    // Just reset the view when location changes
     if (location.search) {
-      window.scrollTo(0, 0);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
     }
   }, [location]);
   
@@ -80,10 +157,32 @@ export default function ResourcePage() {
         setIsLoading(false);
         return;
       }
-      
-      console.log(`ResourcePage: Loading resource with ID: ${id}`);
-      
-      try {
+    
+      // Check if resource is in cache
+      const cachedResource = resourceCache.get(id);
+      if (cachedResource) {
+        console.log('Using cached resource data for', id);
+        setResource(cachedResource);
+        setIsLoading(false);
+        
+        // Get thumbnail and favicon
+        const { thumbnailUrl: thumbUrl, faviconUrl: favUrl } = getResourceThumbnails(cachedResource);
+        setThumbnailUrl(thumbUrl);
+        setFaviconUrl(favUrl);
+        
+        // Check if favorited by user
+        if (user) {
+          checkFavoriteStatus(id);
+        }
+        
+        // Fetch related resources and comments
+        fetchRelatedResources(id, cachedResource.category);
+        fetchComments(id);
+        
+        return;
+      }
+    
+    try {
         // Use our utility function to get the resource by ID
         const result = await getResourceById(id);
         
@@ -96,28 +195,27 @@ export default function ResourcePage() {
         
         let resourceData = result.data;
         
-        // If resourceData is an array, take the first element
+        // Handle the case where resourceData might be an array
         if (Array.isArray(resourceData)) {
-          console.log('Resource data came as array, taking first item:', resourceData);
-          if (resourceData.length > 0) {
-            resourceData = resourceData[0];
-          } else {
-            console.error('Resource data array is empty');
+          console.warn('Resource data returned as array, using first item');
+          if (resourceData.length === 0) {
             setError(t('errors.resourceNotFound', 'Resource not found'));
             setIsLoading(false);
             return;
           }
+          resourceData = resourceData[0];
         }
         
         // Verify we have valid resource data
-        if (!resourceData || !resourceData.id) {
-          console.error('Invalid resource data returned from Supabase:', resourceData);
+        if (!resourceData || !resourceData.id || typeof resourceData !== 'object' || Array.isArray(resourceData)) {
+          console.error('Invalid resource data returned:', resourceData);
           setError(t('errors.invalidData', 'Invalid resource data returned from database'));
           setIsLoading(false);
           return;
         }
         
-        console.log('Resource data loaded successfully:', resourceData);
+        // Cache the resource data
+        resourceCache.set(id, resourceData);
         setResource(resourceData);
         
         // Get thumbnail and favicon
@@ -125,40 +223,49 @@ export default function ResourcePage() {
         setThumbnailUrl(thumbUrl);
         setFaviconUrl(favUrl);
         
-        // Track view
-        if (user) {
+        // Get authentication status
+        const authStatus = await checkAuthStatus();
+        const isAuthenticated = authStatus.authenticated;
+        
+        // Track view - but don't let failures stop the page from loading
+        try {
+          await incrementViewCount(id);
+        } catch (viewError) {
+          // Just log the error and continue - don't block the page load
+          console.warn('Failed to track view count (non-critical):', viewError);
+        }
+        
+        // Check if favorited - only if authenticated
+        if (isAuthenticated) {
           try {
-            const result = await trackResourceView(resourceData.id, user.id);
-            if (!result.success && !result.policyError) {
-              // Log non-policy errors but don't block user experience
-              console.warn('Error tracking view (non-critical):', result.error || result.message);
-            }
-          } catch (trackError) {
-            // Just log tracking errors, don't block user experience
-            console.warn('Error tracking view (non-critical):', trackError);
+            await checkFavoriteStatus(id);
+          } catch (favoriteError) {
+            // Just log the error and continue - don't block the page load
+            console.warn('Failed to check favorite status (non-critical):', favoriteError);
           }
         }
         
-        // Check if favorited
-        if (user) {
-          checkFavoriteStatus(resourceData.id);
+        // Fetch related resources and comments - again, don't block page load on failure
+        try {
+          await fetchRelatedResources(id, resourceData.category);
+        } catch (relatedError) {
+          console.warn('Failed to fetch related resources (non-critical):', relatedError);
+          setRelatedResources([]);
         }
         
-        // Fetch related resources and comments
-        if (resourceData && resourceData.id) {
-          // Fetch related resources
-          fetchRelatedResources(resourceData);
-          
-          // Fetch comments
-          fetchComments(resourceData.id);
+        try {
+          await fetchComments(id);
+        } catch (commentsError) {
+          console.warn('Failed to fetch comments (non-critical):', commentsError);
+          setComments([]);
         }
       } catch (error) {
         console.error('Error in fetchData:', error);
         setError(error.message || t('errors.errorLoadingResource', 'Error loading resource'));
-      } finally {
+    } finally {
         if (mounted) {
-          setIsLoading(false);
-        }
+      setIsLoading(false);
+    }
       }
     };
 
@@ -173,13 +280,11 @@ export default function ResourcePage() {
   const checkFavoriteStatus = async (resourceId) => {
     try {
       // Get current auth status
-      const authStatus = checkAuthStatus();
+      const authStatus = await checkAuthStatus();
       if (!authStatus.authenticated) {
         console.warn('Cannot check favorite status: Not authenticated');
         return;
       }
-      
-      console.log(`Checking favorite status for resource ${resourceId}`);
       
       const { data, error } = await supabase
         .from('favorites')
@@ -189,113 +294,199 @@ export default function ResourcePage() {
         .maybeSingle();
         
       if (error) {
-        // Handle different types of errors
-        if (error.code === '401' || error.status === 401) {
-          console.error('Authentication error checking favorite status:', error);
-          // Don't show error toast as this is a background operation
-        } else if (error.code === '42501' || error.message?.includes('policy')) {
-          console.error('Permission error checking favorite status:', error);
-        } else {
-          console.error('Error checking favorite status:', error);
-        }
+        console.error('Error checking favorite status:', error);
         return;
       }
       
       setIsFavorited(!!data);
     } catch (error) {
       console.error('Unexpected error checking favorite status:', error);
-      // Don't show toast for background operations
+    }
+  };
+  
+  // Increment view count
+  const incrementViewCount = async (resourceId) => {
+    if (!resourceId) return;
+    
+    try {
+      // First check if user is authenticated
+      const authStatus = await checkAuthStatus();
+      const userId = authStatus.authenticated ? authStatus.user?.id : null;
+      
+      const result = await trackResourceView(resourceId, userId);
+      
+      // If the view tracking fails for any reason, try a simple fallback
+      if (!result.success) {
+        // If unauthorized, just log it and do nothing else
+        if (result.error === 'unauthorized' || 
+            (result.error && result.error.code === '42501') || 
+            (result.error && result.error.code === '401')) {
+          console.warn('View tracking disabled due to permissions');
+          return;
+        }
+      
+        console.warn('Error tracking view, trying fallback:', result.error || result.message);
+        
+        try {
+          // Perform a simple insert to resource_views as fallback
+          const { error } = await supabase
+            .from('resource_views')
+            .insert({
+              resource_id: resourceId,
+              created_at: new Date().toISOString()
+            });
+            
+          if (error && (error.code === '401' || error.status === 401 || error.code === '42501')) {
+            console.warn('View tracking disabled due to permissions');
+            return;
+          }
+        } catch (fallbackError) {
+          // We tried our best, just log it
+          console.warn('Fallback view tracking also failed:', fallbackError);
+        }
+      }
+    } catch (error) {
+      // Don't let view tracking errors affect the page load
+      console.warn('Error tracking view (non-critical):', error);
     }
   };
   
   // Fetch related resources
-  const fetchRelatedResources = async (currentResource) => {
-    if (!currentResource?.id || !currentResource?.category) {
-      console.log('Cannot fetch related resources: Invalid resource data', {
-        id: currentResource?.id,
-        category: currentResource?.category
-      });
-      return;
-    }
+  const fetchRelatedResources = async (resourceId, category) => {
+    if (!resourceId) return;
     
     try {
-      console.log(`Fetching related resources for: ${currentResource.title} (ID: ${currentResource.id})`);
-      
       // Try to get resources in the same category first
       const { data, error } = await supabase
         .from('resources')
         .select('*')
-        .eq('category', currentResource.category)
-        .neq('id', currentResource.id)
+        .eq('category', category || '')
+        .neq('id', resourceId)
         .limit(4);
         
       if (error) {
-        console.error('Error fetching related resources by category:', error);
-        
-        // Fall back to get any resources as a backup
-        try {
-          const { data: fallbackData, error: fallbackError } = await supabase
-            .from('resources')
-            .select('*')
-            .neq('id', currentResource.id)
-            .limit(4);
-            
-          if (fallbackError) {
-            console.error('Error fetching fallback related resources:', fallbackError);
-            throw fallbackError;
-          }
-          
-          if (fallbackData && fallbackData.length > 0) {
-            console.log(`Fetched ${fallbackData.length} fallback related resources`);
-            setRelatedResources(fallbackData);
-            return;
-          }
-        } catch (fallbackError) {
-          console.error('Error in fallback related resources fetch:', fallbackError);
-          // Continue to throw the original error
-        }
-        
-        throw error;
+        console.error('Error fetching related resources:', error);
+        setRelatedResources([]);
+        return;
       }
       
-      if (data && data.length > 0) {
-        console.log(`Fetched ${data.length} related resources in category: ${currentResource.category}`);
-        setRelatedResources(data);
-      } else {
-        // If no resources in the same category, try subcategory
-        if (currentResource.subcategory) {
-          const { data: subcategoryData, error: subcategoryError } = await supabase
-            .from('resources')
-            .select('*')
-            .eq('subcategory', currentResource.subcategory)
-            .neq('id', currentResource.id)
-            .limit(4);
-            
-          if (!subcategoryError && subcategoryData && subcategoryData.length > 0) {
-            console.log(`Fetched ${subcategoryData.length} related resources by subcategory`);
-            setRelatedResources(subcategoryData);
-            return;
+      // Ensure data is an array
+      const resourcesData = Array.isArray(data) ? data : (data ? [data] : []);
+      
+      // Get authentication status for user data fetching
+      const authStatus = await checkAuthStatus();
+      const isAuthenticated = authStatus.authenticated;
+      
+      // Process resources to add user data
+      const processedResources = await Promise.all(
+        (resourcesData || []).map(async (resource) => {
+          // If resource already has user object, use it
+          if (resource.user) {
+            // If user is an array, take the first item
+            if (Array.isArray(resource.user)) {
+              resource.user = resource.user[0] || { 
+                username: resource.user_id ? `User ${resource.user_id.substring(0, 5)}` : 'Anonymous',
+                avatar_url: null
+              };
+            }
+            return resource;
           }
-        }
-        
-        // If still no results, get any 4 resources
-        const { data: anyData, error: anyError } = await supabase
-          .from('resources')
-          .select('*')
-          .neq('id', currentResource.id)
-          .limit(4);
           
-        if (!anyError && anyData && anyData.length > 0) {
-          console.log(`Fetched ${anyData.length} general related resources`);
-          setRelatedResources(anyData);
+          let userData = null;
+          
+          // Try to get user info if user_id exists
+          if (resource.user_id) {
+            try {
+              // Try users table first
+              const { data: userInfo, error: userError } = await supabase
+                .from('users')
+                .select('username, avatar_url')
+                .eq('id', resource.user_id)
+                .single();
+              
+              if (!userError && userInfo) {
+                // Handle userInfo as array if needed
+                userData = Array.isArray(userInfo) ? userInfo[0] : userInfo;
+              } else {
+                // Fallback to profiles table
+                try {
+                  const { data: profileInfo, error: profileError } = await supabase
+                    .from('profiles')
+                    .select('username, avatar_url')
+                    .eq('id', resource.user_id)
+                    .single();
+                  
+                  if (!profileError && profileInfo) {
+                    // Handle profileInfo as array if needed
+                    userData = Array.isArray(profileInfo) ? profileInfo[0] : profileInfo;
+                  }
+                } catch (profileError) {
+                  console.warn('Failed to fetch profile data for resource:', profileError);
+                }
+              }
+            } catch (userError) {
+              console.warn('Failed to fetch user data for resource:', userError);
+            }
+          }
+          
+          // Return resource with user data or fallback
+          return {
+            ...resource,
+            user: userData || {
+              username: resource.user_id ? `User ${resource.user_id.substring(0, 5)}` : 'Anonymous',
+              avatar_url: null
+            }
+          };
+        })
+      );
+      
+      if (processedResources && processedResources.length > 0) {
+        setRelatedResources(processedResources);
+      } else {
+        // If no results, get any 4 resources
+        const { data: anyData, error: anyError } = await supabase
+        .from('resources')
+        .select('*')
+        .neq('id', resourceId)
+        .limit(4);
+        
+        if (!anyError && anyData) {
+          // Ensure anyData is an array
+          const anyResourcesData = Array.isArray(anyData) ? anyData : (anyData ? [anyData] : []);
+          
+          // Process these resources too
+          const processedAnyResources = await Promise.all(
+            anyResourcesData.map(async (resource) => {
+              // If resource already has user object, use it
+              if (resource.user) {
+                // If user is an array, take the first item
+                if (Array.isArray(resource.user)) {
+                  resource.user = resource.user[0] || { 
+                    username: resource.user_id ? `User ${resource.user_id.substring(0, 5)}` : 'Anonymous',
+                    avatar_url: null
+                  };
+                }
+                return resource;
+              }
+              
+              // Return resource with basic user data
+              return {
+                ...resource,
+                user: {
+                  username: resource.user_id ? `User ${resource.user_id.substring(0, 5)}` : 'Anonymous',
+                  avatar_url: null
+                }
+              };
+            })
+          );
+          
+          setRelatedResources(processedAnyResources);
         } else {
-          console.log('No related resources found');
           setRelatedResources([]);
         }
       }
     } catch (error) {
       console.error('Error fetching related resources:', error);
-      // Set empty array to avoid undefined errors
       setRelatedResources([]);
     }
   };
@@ -306,74 +497,120 @@ export default function ResourcePage() {
     
     setIsLoadingComments(true);
     
-    try {
-      const { data, error } = await supabase
-        .from('comments')
-        .select('*')
-        .eq('resource_id', resourceId)
-        .order('created_at', { ascending: false });
+      try {
+        const { data, error } = await supabase
+          .from('comments')
+          .select('*')
+          .eq('resource_id', resourceId)
+          .order('created_at', { ascending: false });
         
       if (error) throw error;
       
-      setComments(data || []);
-    } catch (error) {
+      // Ensure data is an array
+      const commentsData = Array.isArray(data) ? data : (data ? [data] : []);
+      
+      // Process comments to ensure they have user data
+      const processedComments = await Promise.all(
+        (commentsData || []).map(async (comment) => {
+          // If comment already has user object, use it
+          if (comment.user) {
+            // If user is an array, take the first item
+            if (Array.isArray(comment.user)) {
+              comment.user = comment.user[0] || { 
+                username: comment.user_id ? `User ${comment.user_id.substring(0, 5)}` : 'Anonymous',
+                avatar_url: null
+              };
+            }
+            return comment;
+          }
+          
+          let userData = null;
+          
+          // Try to get user info if user_id exists
+          if (comment.user_id) {
+            try {
+              // Try users table first
+              const { data: userInfo, error: userError } = await supabase
+                .from('users')
+                .select('username, avatar_url')
+                .eq('id', comment.user_id)
+                .single();
+              
+              if (!userError && userInfo) {
+                // Handle userInfo as array if needed
+                userData = Array.isArray(userInfo) ? userInfo[0] : userInfo;
+              } else {
+                // Fallback to profiles table
+                try {
+                  const { data: profileInfo, error: profileError } = await supabase
+                    .from('profiles')
+                    .select('username, avatar_url')
+                    .eq('id', comment.user_id)
+                    .single();
+                  
+                  if (!profileError && profileInfo) {
+                    // Handle profileInfo as array if needed
+                    userData = Array.isArray(profileInfo) ? profileInfo[0] : profileInfo;
+                  }
+                } catch (profileError) {
+                  console.warn('Failed to fetch profile data for comment:', profileError);
+                }
+              }
+            } catch (userError) {
+              console.warn('Failed to fetch user data for comment:', userError);
+            }
+          }
+          
+          // Return comment with user data or fallback
+          return {
+          ...comment,
+            user: userData || {
+              username: comment.user_id ? `User ${comment.user_id.substring(0, 5)}` : 'Anonymous',
+            avatar_url: null
+          }
+          };
+        })
+      );
+        
+      setComments(processedComments || []);
+      } catch (error) {
       console.error('Error fetching comments:', error);
       toast.error(t('common.error.comments', 'Failed to load comments'));
-    } finally {
-      setIsLoadingComments(false);
-    }
+      setComments([]);
+      } finally {
+        setIsLoadingComments(false);
+      }
   };
   
-  // Toggle favorite using our utility function
+  // Toggle favorite
   const handleToggleFavorite = async () => {
-    if (!user) {
-      toast(t('auth.signInRequired'), { icon: '🔒' });
-      return;
-    }
-    
-    setIsLoadingFavorite(true);
-    
     try {
-      console.log(`Attempting to toggle favorite for resource ${resource.id} by user ${user.id}`);
+      // Check authentication status first
+      const authStatus = await checkAuthStatus();
       
-      // Ensure we have a valid Supabase session - using the updated method
-      const { data: { session } } = await supabase.auth.getSession();
-      if (!session || !session.access_token) {
-        console.error('No valid Supabase session found when toggling favorite');
-        toast.error(t('auth.sessionExpired', 'Your session has expired. Please sign in again.'));
-        setIsLoadingFavorite(false);
+      if (!authStatus.authenticated) {
+        toast(t('auth.signInRequired'), { icon: '🔒' });
         return;
       }
       
-      // Call the utility function
-      const result = await toggleFavorite(resource.id, user.id, isFavorited);
+      setIsLoadingFavorite(true);
+      
+      // Call the utility function with user ID from auth status
+      const result = await toggleFavoriteUtil(resource.id, authStatus.user.id, isFavorited);
       
       if (result.success) {
-        console.log(`Successfully ${result.isFavorited ? 'added to' : 'removed from'} favorites`);
         setIsFavorited(result.isFavorited);
-        toast.success(
-          result.isFavorited 
-            ? t('resource.favorites.added', 'Added to favorites') 
-            : t('resource.favorites.removed', 'Removed from favorites')
+        toast.success(result.isFavorited ? 
+          t('resource.addedToFavorites', 'Added to favorites') : 
+          t('resource.removedFromFavorites', 'Removed from favorites')
         );
       } else if (result.authError) {
-        // Handle authentication errors
-        console.error('Authentication error when toggling favorite:', result.error);
         toast.error(t('auth.sessionExpired', 'Your session has expired. Please sign in again.'));
-      } else if (result.policyError) {
-        // Handle row-level security policy errors
-        console.error('Policy error when toggling favorite:', result.error);
-        
-        // Use the message from the result if available, or a default message
-        const errorMessage = result.message || t('errors.permissionDenied', 'You do not have permission to perform this action.');
-        toast.error(errorMessage);
       } else {
-        // Handle other errors
-        console.error('Error toggling favorite:', result.error);
-        toast.error(result.message || t('common.error', 'An error occurred. Please try again.'));
+        toast.error(t('common.error', 'An error occurred. Please try again.'));
       }
     } catch (error) {
-      console.error('Unexpected error in handleToggleFavorite:', error);
+      console.error('Error toggling favorite:', error);
       toast.error(t('common.error', 'An error occurred. Please try again.'));
     } finally {
       setIsLoadingFavorite(false);
@@ -392,28 +629,31 @@ export default function ResourcePage() {
       })
       .catch(() => {
         navigator.clipboard.writeText(shareUrl);
-        toast(t('resource.share.copied'), { icon: '📋' });
+        toast.success(t('resource.share.copied'), { icon: '📋' });
       });
     } else {
       navigator.clipboard.writeText(shareUrl);
-      toast(t('resource.share.copied'), { icon: '📋' });
+      toast.success(t('resource.share.copied'), { icon: '📋' });
     }
   };
   
   // Navigate to tag filter
   const handleTagClick = (tag) => {
-    // Ensure tag is properly encoded for URL
     const encodedTag = encodeURIComponent(tag.trim());
     navigate(`/category/all?tag=${encodedTag}`);
   };
   
   // Open external URL
-  const openExternalUrl = () => {
+  const openExternalUrl = async () => {
     if (resource?.url) {
-      // Track view before opening external URL
-      if (user) {
-        trackResourceView(resource.id, user.id);
+      // Track view before opening external URL - don't block URL opening if tracking fails
+      try {
+        await incrementViewCount(resource.id);
+      } catch (error) {
+        console.warn('Error tracking view for external URL (non-critical):', error);
       }
+      
+      // Open URL in new tab
       window.open(resource.url, '_blank', 'noopener,noreferrer');
     }
   };
@@ -426,155 +666,202 @@ export default function ResourcePage() {
   
   // Handle back button click
   const handleBack = () => {
-    // Check if we have a previous location in history
     if (window.history.length > 1) {
-      navigate(-1); // Go back to previous page
+      navigate(-1);
     } else {
-      // If no history, go to home page
       navigate('/');
     }
   };
   
+  // Make sure resource is never an array when used in the UI
+  const ensureResource = (resource) => {
+    if (!resource) return null;
+    if (Array.isArray(resource)) {
+      return resource.length > 0 ? resource[0] : null;
+    }
+    return resource;
+  };
+  
   if (isLoading) {
     return (
-      <div className="container mx-auto px-4 py-16 min-h-screen flex items-center justify-center">
-        <div className="w-16 h-16 border-4 border-lime-accent border-solid rounded-full border-t-transparent animate-spin"></div>
-      </div>
+      <motion.div 
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        className="container mx-auto px-4 py-16 min-h-screen flex items-center justify-center"
+      >
+        <div className="w-16 h-16 border-4 border-[#bfff58] border-solid rounded-full border-t-transparent animate-spin"></div>
+      </motion.div>
     );
   }
   
   if (error) {
     return (
-      <div className="container mx-auto px-4 py-16 min-h-screen flex flex-col items-center justify-center">
+      <motion.div 
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.5 }}
+        className="container mx-auto px-4 py-16 min-h-screen flex flex-col items-center justify-center"
+      >
         <h1 className="text-2xl font-bold text-white mb-4">{t('errors.error', 'Error')}</h1>
         <p className="text-gray-400 mb-8">{error}</p>
         <div className="flex space-x-4">
-          <button 
+          <motion.button 
+            whileHover={{ scale: 1.05 }}
+            whileTap={{ scale: 0.95 }}
             onClick={() => window.location.reload()}
-            className="px-4 py-2 bg-lime-accent text-dark-900 rounded-md flex items-center"
+            className="px-4 py-2 bg-[#bfff58] text-dark-900 rounded-md flex items-center shadow-lg transition-all duration-300"
           >
             <RefreshIcon className="w-4 h-4 mr-2" />
             {t('common.retry', 'Retry')}
-          </button>
-          <button 
+          </motion.button>
+          <motion.button 
+            whileHover={{ scale: 1.05 }}
+            whileTap={{ scale: 0.95 }}
             onClick={() => navigate('/')}
-            className="px-4 py-2 bg-dark-300 text-white rounded-md flex items-center"
+            className="px-4 py-2 bg-dark-300 text-white rounded-md flex items-center transition-all duration-300"
           >
             <ArrowLeftIcon className="w-4 h-4 mr-2" />
             {t('common.backToHome', 'Back to Home')}
-          </button>
+          </motion.button>
         </div>
-      </div>
+      </motion.div>
     );
   }
   
   if (!resource) {
-    return (
-      <div className="container mx-auto px-4 py-16 min-h-screen flex flex-col items-center justify-center">
+  return (
+      <motion.div 
+        initial={{ opacity: 0, y: 20 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.5 }}
+        className="container mx-auto px-4 py-16 min-h-screen flex flex-col items-center justify-center"
+      >
         <h1 className="text-2xl font-bold text-white mb-4">{t('errors.resourceNotFound')}</h1>
         <p className="text-gray-400 mb-8">{t('errors.resourceNotFoundDesc')}</p>
-        <button 
+        <motion.button 
+          whileHover={{ scale: 1.05 }}
+          whileTap={{ scale: 0.95 }}
           onClick={() => navigate('/')}
-          className="px-4 py-2 bg-dark-300 text-white rounded-md flex items-center"
+          className="px-4 py-2 bg-dark-300 text-white rounded-md flex items-center transition-all duration-300"
         >
           <ArrowLeftIcon className="w-4 h-4 mr-2" />
           {t('common.backToHome')}
-        </button>
-      </div>
+        </motion.button>
+      </motion.div>
     );
   }
   
   return (
-    <>
+    <motion.div
+      initial="hidden"
+      animate="visible"
+      variants={fadeIn}
+    >
       <Helmet>
-        <title>
-          {resource 
-            ? `${resource.title} - Mindy`
-            : t('resource.loading')}
-        </title>
-        <meta 
-          name="description" 
-          content={resource ? `${resource.title} - View details and related resources` : ''} 
-        />
+        <title>{resource.title} - Mindy</title>
+        <meta name="description" content={resource.description || `${resource.title} - View details and related resources`} />
       </Helmet>
       
       <div className="container mx-auto px-4 py-6 md:py-12">
-        {/* Back button */}
-        <div className="flex items-center justify-between mb-8">
-          <button 
+        {/* Back button and action buttons */}
+        <motion.div 
+          variants={slideUp}
+          className="flex items-center justify-between mb-8"
+        >
+          <motion.button 
+            whileHover={{ x: -3 }}
             onClick={handleBack}
             className="flex items-center text-gray-400 hover:text-white transition-colors"
           >
             <ArrowLeftIcon className="w-5 h-5 mr-2" />
             {t('ui.back')}
-          </button>
+          </motion.button>
           
-          <div className="flex items-center space-x-4">
-            <button 
+          <div className="flex items-center space-x-3">
+            <motion.button 
+              whileHover={{ scale: 1.05 }}
+              whileTap={{ scale: 0.95 }}
               onClick={handleToggleFavorite}
               disabled={isLoadingFavorite}
-              className="flex items-center px-4 py-2 rounded-lg bg-dark-800 hover:bg-dark-700 transition-colors"
+              className="flex items-center px-4 py-2 rounded-lg bg-dark-800 hover:bg-dark-700 transition-all duration-300"
               aria-label={t(isFavorited ? 'resource.removeFavorite' : 'resource.addFavorite')}
             >
               {isFavorited ? (
-                <HeartSolidIcon className="w-5 h-5 text-red-500 mr-2" />
+                <HeartSolidIcon className="w-5 h-5 text-[#bfff58] mr-2" />
               ) : (
                 <HeartIcon className="w-5 h-5 text-gray-400 mr-2" />
               )}
-              {t(isFavorited ? 'resource.saved' : 'resource.save')}
-            </button>
+              <span className="hidden sm:inline">
+                {t(isFavorited ? 'resource.saved' : 'resource.save')}
+              </span>
+            </motion.button>
             
-            <button 
+            <motion.button 
+              whileHover={{ scale: 1.05 }}
+              whileTap={{ scale: 0.95 }}
               onClick={shareResource}
-              className="flex items-center px-4 py-2 rounded-lg bg-dark-800 hover:bg-dark-700 transition-colors"
+              className="flex items-center px-4 py-2 rounded-lg bg-dark-800 hover:bg-dark-700 transition-all duration-300"
               aria-label={t('resource.share')}
             >
               <ShareIcon className="w-5 h-5 text-gray-400 mr-2" />
-              {t('resource.share')}
-            </button>
+              <span className="hidden sm:inline">{t('resource.share')}</span>
+            </motion.button>
             
-            <a
+            <motion.a
+              whileHover={{ scale: 1.05 }}
+              whileTap={{ scale: 0.95 }}
               href={resource.url}
               target="_blank"
               rel="noopener noreferrer"
               onClick={openExternalUrl}
-              className="flex items-center px-4 py-2 rounded-lg bg-lime-accent text-dark-900 hover:bg-lime-accent/90 transition-colors"
+              className="flex items-center px-4 py-2 rounded-lg bg-[#bfff58] text-dark-900 hover:bg-[#bfff58]/90 transition-all duration-300 shadow-lg"
             >
               <ExternalLinkIcon className="w-5 h-5 mr-2" />
-              {t('resource.visitWebsite')}
-            </a>
+              <span className="hidden sm:inline">{t('resource.visitWebsite')}</span>
+            </motion.a>
           </div>
-        </div>
+        </motion.div>
         
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
           {/* Main content */}
-          <div className="lg:col-span-2">
+          <motion.div 
+            variants={slideUp}
+            className="lg:col-span-2"
+          >
             {/* Resource header */}
-            <div className="bg-dark-200 rounded-xl overflow-hidden shadow-xl">
+            <motion.div 
+              initial={{ y: 20, opacity: 0 }}
+              animate={{ y: 0, opacity: 1 }}
+              transition={{ duration: 0.5 }}
+              className="bg-dark-200 rounded-xl overflow-hidden shadow-xl"
+            >
               {/* Resource image */}
               <div className="relative h-56 md:h-96 overflow-hidden">
-                {resource.image_url ? (
-                  <img 
-                    src={resource.image_url} 
-                    alt={resource.title}
-                    className="w-full h-full object-cover"
-                  />
-                ) : (
-                  <AutoThumbnail 
-                    src={thumbnailUrl}
-                    alt={resource.title}
-                    url={resource.url}
-                    title={resource.title}
-                    category={resource.category || ''}
-                    subcategory={resource.subcategory || ''}
-                    tags={resource.tags || []}
-                    className="w-full h-full object-cover"
-                    onError={(e) => {
-                      console.error('Thumbnail error in ResourcePage:', e);
-                      setThumbnailUrl(null);
-                    }}
-                  />
-                )}
+                <motion.div
+                  initial={{ scale: 1.1 }}
+                  animate={{ scale: 1 }}
+                  transition={{ duration: 0.7 }}
+                  className="h-full w-full"
+                >
+                  {resource.image_url ? (
+                    <img 
+                      src={resource.image_url} 
+                alt={resource.title}
+                      className="w-full h-full object-cover"
+                    />
+                  ) : (
+                    <AutoThumbnail 
+                      src={thumbnailUrl}
+                      alt={resource.title}
+                      url={resource.url}
+                      title={resource.title}
+                      category={resource.category || ''}
+                      subcategory={resource.subcategory || ''}
+                      tags={resource.tags || []}
+                      className="w-full h-full object-cover"
+                    />
+                  )}
+                </motion.div>
                 
                 {/* Gradient overlay */}
                 <div className="absolute inset-0 bg-gradient-to-t from-dark-200 to-transparent"></div>
@@ -582,136 +869,188 @@ export default function ResourcePage() {
                 {/* Action buttons */}
                 <div className="absolute bottom-0 left-0 right-0 p-6 flex justify-between items-center">
                   <h1 className="text-2xl md:text-3xl font-bold text-white">{resource.title}</h1>
-                  
+                
                   <div className="flex items-center space-x-3">
-                    <button 
+                    <motion.button 
+                      whileHover={{ scale: 1.1 }}
+                      whileTap={{ scale: 0.9 }}
                       onClick={handleToggleFavorite}
                       disabled={isLoadingFavorite}
-                      className="p-3 rounded-full bg-dark-300/80 hover:bg-dark-400 transition-colors"
-                      aria-label={isFavorited ? 'Remove from favorites' : 'Add to favorites'}
+                      className="p-3 rounded-full bg-dark-300/80 hover:bg-dark-400 backdrop-blur-sm transition-all duration-300"
+                      aria-label={isFavorited ? t('resource.removeFavorite') : t('resource.addFavorite')}
                     >
                       {isFavorited ? (
-                        <HeartSolidIcon className="w-6 h-6 text-lime-accent" />
+                        <HeartSolidIcon className="w-6 h-6 text-[#bfff58]" />
                       ) : (
                         <HeartIcon className="w-6 h-6 text-white" />
                       )}
-                    </button>
-                    
-                    <button 
-                      onClick={shareResource}
-                      className="p-3 rounded-full bg-dark-300/80 hover:bg-dark-400 transition-colors"
-                      aria-label="Share resource"
+                    </motion.button>
+                  
+                    <motion.button 
+                      whileHover={{ scale: 1.1 }}
+                      whileTap={{ scale: 0.9 }}
+                    onClick={shareResource}
+                      className="p-3 rounded-full bg-dark-300/80 hover:bg-dark-400 backdrop-blur-sm transition-all duration-300"
+                      aria-label={t('resource.share')}
                     >
                       <ShareIcon className="w-6 h-6 text-white" />
-                    </button>
-                    
-                    <button
+                    </motion.button>
+              
+                    <motion.button
+                      whileHover={{ scale: 1.05 }}
+                      whileTap={{ scale: 0.95 }}
                       onClick={openExternalUrl}
-                      className="px-5 py-3 bg-lime-accent text-dark-100 rounded-lg text-sm font-medium hover:bg-lime-accent/90 transition-colors flex items-center shadow-lg"
+                      className="px-5 py-3 bg-[#bfff58] text-dark-900 rounded-lg text-sm font-medium hover:bg-[#bfff58]/90 transition-all duration-300 flex items-center shadow-lg"
                     >
-                      Visit Website
+                      {t('resource.visitWebsite')}
                       <ExternalLinkIcon className="w-4 h-4 ml-2" />
-                    </button>
+                    </motion.button>
                   </div>
                 </div>
               </div>
               
-              {/* Remove tabs navigation, show details directly */}
-              <div className="p-6">
-                <div className="space-y-8">
+              {/* Content */}
+              <motion.div 
+                variants={staggerChildren}
+                className="p-6"
+              >
+                <motion.div variants={fadeIn} className="space-y-8">
                   {/* Description */}
                   {resource.description && (
-                    <div>
+                    <motion.div variants={slideUp}>
                       <h2 className="text-xl font-medium mb-4 text-white">{t('resource.description')}</h2>
                       <p className="text-gray-300 leading-relaxed">{resource.description}</p>
-                    </div>
+                    </motion.div>
                   )}
                   
                   {/* Tags */}
                   {resource.tags && resource.tags.length > 0 && (
-                    <div>
+                    <motion.div variants={slideUp}>
                       <h2 className="text-lg font-medium mb-4 text-white flex items-center">
                         <TagIcon className="w-5 h-5 mr-2 text-gray-400" />
                         {t('resource.tags')}
                       </h2>
-                      <div className="flex flex-wrap gap-3">
-                        {resource.tags.map((tag) => {
-                          // Check if tag has a translation
+                      <motion.div 
+                        variants={staggerChildren}
+                        className="flex flex-wrap gap-3"
+                      >
+                        {resource.tags.map((tag, index) => {
                           const translatedTag = t(`tags.${tag.toLowerCase()}`, tag);
                           
                           return (
-                            <button
+                            <motion.button
                               key={tag}
+                              variants={fadeIn}
+                              initial={{ opacity: 0, scale: 0.8 }}
+                              animate={{ opacity: 1, scale: 1 }}
+                              transition={{ delay: index * 0.05 }}
+                              whileHover={{ scale: 1.05, backgroundColor: '#2a2a2a' }}
+                              whileTap={{ scale: 0.95 }}
                               onClick={() => handleTagClick(tag)}
-                              className="flex items-center px-4 py-2 rounded-md bg-dark-300 text-white hover:bg-dark-400 transition-colors text-sm"
+                              className="flex items-center px-4 py-2 rounded-md bg-dark-300 text-white transition-all duration-300 text-sm"
                             >
                               {isSoftwareTag(tag) && (
                                 <SoftwareIcon name={tag} className="mr-2 w-4 h-4" />
                               )}
                               {translatedTag}
-                            </button>
+                            </motion.button>
                           );
                         })}
-                      </div>
-                    </div>
+                      </motion.div>
+                    </motion.div>
                   )}
-                  
-                  {/* Details */}
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                    {/* Categories */}
-                    {(resource.category || resource.subcategory) && (
-                      <div>
-                        <h2 className="text-lg font-medium mb-4 text-white">{t('resource.category')}</h2>
-                        <div className="flex flex-wrap gap-3">
-                          {resource.category && (
-                            <button
-                              onClick={() => navigate(`/category/${resource.category}`)}
-                              className="flex items-center px-4 py-2 rounded-md bg-dark-300 text-white hover:bg-dark-400 transition-colors text-sm"
-                            >
-                              {resource.category}
-                            </button>
-                          )}
-                          {resource.subcategory && (
-                            <button
-                              onClick={() => navigate(`/category/${resource.subcategory}`)}
-                              className="flex items-center px-4 py-2 rounded-md bg-dark-300 text-white hover:bg-dark-400 transition-colors text-sm"
-                            >
-                              {resource.subcategory}
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-          
-          {/* Comments Section */}
-          <div className="mt-8">
-            <CommentSection 
-              comments={comments} 
-              resourceId={resource.id}
-              isLoading={isLoadingComments}
-              onCommentAdded={() => fetchComments(resource.id)}
-            />
-          </div>
-        </div>
-        
-        {/* Sidebar with Related Resources */}
-        <div className="lg:col-span-1">
-          <div className="bg-dark-200 rounded-xl p-6 shadow-xl">
-            <h2 className="text-xl font-medium mb-4 text-white">{t('resource.relatedResources', 'Related Resources')}</h2>
+                </motion.div>
+              </motion.div>
+            </motion.div>
             
-            <RelatedResources 
-              resources={relatedResources}
-              category={resource.category}
-              currentResourceId={resource.id}
-            />
-          </div>
+            {/* Comments Section */}
+            <motion.div 
+              variants={slideUp}
+              className="mt-8"
+            >
+              <CommentSection
+                resourceId={resource.id}
+                comments={comments}
+                isLoading={isLoadingComments}
+                onCommentPosted={() => fetchComments(resource.id)}
+              />
+            </motion.div>
+          </motion.div>
+          
+          {/* Sidebar */}
+          <motion.div 
+            variants={slideUp}
+            className="lg:col-span-1"
+          >
+            {/* Related Resources */}
+            <motion.div 
+              variants={fadeIn}
+              className="bg-dark-200 p-6 rounded-xl shadow-lg mb-6"
+            >
+              <h2 className="text-xl font-medium mb-6 text-white">{t('resource.related')}</h2>
+              <RelatedResources 
+                resources={relatedResources} 
+                isLoading={isLoading}
+              />
+            </motion.div>
+            
+            {/* Resource Info */}
+            <motion.div 
+              variants={fadeIn}
+              className="bg-dark-200 p-6 rounded-xl shadow-lg"
+            >
+              <h2 className="text-xl font-medium mb-6 text-white">{t('resource.information')}</h2>
+              
+              <div className="space-y-4">
+                {resource.category && (
+                  <div>
+                    <h3 className="text-gray-400 text-sm mb-1">{t('resource.category')}</h3>
+                    <p className="text-white">{resource.category}</p>
+                  </div>
+                )}
+                
+                {resource.subcategory && (
+                  <div>
+                    <h3 className="text-gray-400 text-sm mb-1">{t('resource.subcategory')}</h3>
+                    <p className="text-white">{resource.subcategory}</p>
+                  </div>
+                )}
+                
+                {resource.created_at && (
+                  <div>
+                    <h3 className="text-gray-400 text-sm mb-1">{t('resource.addedOn')}</h3>
+                    <p className="text-white">
+                      {new Date(resource.created_at).toLocaleDateString()}
+                      {' '}
+                      ({formatDistanceToNow(new Date(resource.created_at), { addSuffix: true })})
+                    </p>
+                  </div>
+                )}
+                
+                {resource.user && (
+                  <div>
+                    <h3 className="text-gray-400 text-sm mb-1">{t('resource.addedBy')}</h3>
+                    <p className="text-white">{resource.user.username || t('user.anonymous')}</p>
+                  </div>
+                )}
+                
+                {faviconUrl && (
+                  <div className="flex items-center mt-4">
+                    <img 
+                      src={faviconUrl} 
+                      alt={resource.title} 
+                      className="w-6 h-6 mr-2 rounded-sm"
+                    />
+                    <span className="text-gray-300 truncate">{new URL(resource.url).hostname}</span>
+                  </div>
+                )}
+              </div>
+            </motion.div>
+          </motion.div>
         </div>
       </div>
-    </>
+    </motion.div>
   );
-}
+};
+
+export default ResourcePage;

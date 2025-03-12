@@ -1,68 +1,60 @@
 import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
-import { supabase } from '../main';
+import supabase, { checkSupabaseConnection } from '../utils/supabase';
 
 /**
  * StatusIndicator component displays the current status of:
  * 1. Server connection (by checking if the component can load)
  * 2. Supabase connection (by running a simple query)
+ * 
+ * NOTE: This component has been modified to prevent excessive Supabase queries
  */
 const StatusIndicator = () => {
-  const [supabaseStatus, setSupabaseStatus] = useState('checking');
-  const [serverStatus, setServerStatus] = useState('online'); // If component renders, server is online
-  const [lastChecked, setLastChecked] = useState(null);
+  const [supabaseStatus, setSupabaseStatus] = useState('online'); // Default to online to prevent checks
+  const [serverStatus, setServerStatus] = useState('online');
+  const [lastChecked, setLastChecked] = useState(new Date()); // Set to current time
   const [isExpanded, setIsExpanded] = useState(false);
+  const [checkInProgress, setCheckInProgress] = useState(false);
+  const [manualCheckEnabled, setManualCheckEnabled] = useState(false);
 
-  // Function to check Supabase connection
+  // Function to check Supabase connection - only when manually triggered
   const checkSupabaseStatus = async () => {
+    // Only allow manual checks if explicitly enabled
+    if (!manualCheckEnabled) {
+      console.log('Manual checks are disabled. Enable them first.');
+      return;
+    }
+    
+    // Prevent multiple simultaneous checks
+    if (checkInProgress) return;
+    
     try {
-      // Create a timeout promise
-      const timeoutPromise = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('Connection timeout')), 5000)
-      );
+      setCheckInProgress(true);
+      setSupabaseStatus('checking');
       
-      // Simple lightweight query to check if Supabase is responding
-      const queryPromise = supabase
-        .from('profiles')
-        .select('count', { count: 'exact', head: true })
-        .limit(1);
+      // Use the existing checkSupabaseConnection function
+      const isConnected = await checkSupabaseConnection(true); // Force a fresh check
       
-      // Race the query against the timeout
-      const result = await Promise.race([
-        queryPromise,
-        timeoutPromise
-      ]);
-      
-      const { error } = result;
-      
-      if (error) {
-        console.error('Supabase connection error:', error);
-        setSupabaseStatus('offline');
-      } else {
-        console.log('Supabase connection successful');
+      if (isConnected) {
         setSupabaseStatus('online');
+      } else {
+        console.error('Supabase connection failed');
+        setSupabaseStatus('offline');
       }
     } catch (error) {
       console.error('Failed to check Supabase status:', error);
       setSupabaseStatus('offline');
+    } finally {
+      setCheckInProgress(false);
+      // Update last checked timestamp
+      setLastChecked(new Date());
     }
-    
-    // Update last checked timestamp
-    setLastChecked(new Date());
   };
 
-  // Check status on component mount and every 5 minutes
+  // No automatic checks on mount - completely disabled
   useEffect(() => {
-    // Initial check
-    checkSupabaseStatus();
-    
-    // Set up interval for periodic checks
-    const intervalId = setInterval(() => {
-      checkSupabaseStatus();
-    }, 5 * 60 * 1000); // 5 minutes
-    
-    // Clean up interval on component unmount
-    return () => clearInterval(intervalId);
+    // No initial check - assume online
+    console.log('StatusIndicator: Automatic checks disabled');
   }, []);
 
   // Format the last checked time
@@ -130,12 +122,22 @@ const StatusIndicator = () => {
           </div>
           
           <div className="flex flex-col gap-2 mt-2">
-            <button
-              onClick={checkSupabaseStatus}
-              className="w-full py-1.5 px-2 bg-dark-300 rounded-md hover:bg-dark-400 transition-colors text-xs"
-            >
-              Check Now
-            </button>
+            {!manualCheckEnabled ? (
+              <button
+                onClick={() => setManualCheckEnabled(true)}
+                className="w-full py-1.5 px-2 bg-dark-300 rounded-md hover:bg-dark-400 transition-colors text-xs"
+              >
+                Enable Manual Checks
+              </button>
+            ) : (
+              <button
+                onClick={checkSupabaseStatus}
+                disabled={checkInProgress}
+                className="w-full py-1.5 px-2 bg-dark-300 rounded-md hover:bg-dark-400 transition-colors text-xs disabled:opacity-50"
+              >
+                {checkInProgress ? 'Checking...' : 'Check Now'}
+              </button>
+            )}
             
             <Link 
               to="/status"

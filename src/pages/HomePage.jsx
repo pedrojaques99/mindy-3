@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Link, useNavigate, useLocation } from 'react-router-dom';
 import { motion } from 'framer-motion';
-import { supabase, checkSupabaseConnection } from '../main';
+import supabase, { checkSupabaseConnection } from '../utils/supabase';
 import { useUser } from '../context/UserContext';
 import { useLanguage } from '../context/LanguageContext';
 import { loadTranslations } from '../utils/translations';
@@ -31,6 +31,7 @@ import {
   AdjustmentsIcon,
   XIcon
 } from '@heroicons/react/outline';
+import { HeartIcon as HeartSolidIcon } from '@heroicons/react/solid';
 import ResourceCard from '../components/ResourceCard';
 import SoftwareIcon from '../components/ui/SoftwareIcon';
 import toast from 'react-hot-toast';
@@ -157,6 +158,7 @@ const HomePage = () => {
   const [recentResources, setRecentResources] = useState([]);
   const [popularResources, setPopularResources] = useState([]);
   const [trendingResources, setTrendingResources] = useState([]);
+  const [mostLikedResources, setMostLikedResources] = useState([]);
   const [loading, setLoading] = useState(true);
   const [categories, setCategories] = useState(INITIAL_CATEGORIES);
   const [softwareCategories, setSoftwareCategories] = useState([]);
@@ -166,48 +168,99 @@ const HomePage = () => {
     software: null
   });
   const [selectedFilterDisplay, setSelectedFilterDisplay] = useState({});
+  const [isSupabaseMode, setIsSupabaseMode] = useState(localStorage.getItem('forceSupabaseConnection') === 'true');
   
-  // Get flattened subcategories
-  const subcategories = Object.values(categories).flatMap(category => category.subcategories);
+  // Add refs to track if operations have been performed
+  const resourcesFetched = useRef(false);
+  const categoriesFetched = useRef(false);
+  const softwareFetched = useRef(false);
+  const connectionChecked = useRef(false);
   
-  // Check database connection on mount
-  useEffect(() => {
-    const checkConnection = async () => {
-      const connectionStatus = await checkSupabaseConnection();
-      
-      if (!connectionStatus.success) {
-        console.error('Database connection details:', connectionStatus);
-        setConnectionError(true);
-        
-        // Show more detailed toast with the actual error
-        const errorMessage = connectionStatus.error?.message || 'Unknown error';
-        toast.error(`Database connection failed: ${errorMessage}. Using fallback data.`, {
-          duration: 5000 // Show for longer to make sure user sees it
-        });
-        
-        // If this is a network error, show a different message
-        if (errorMessage.includes('Failed to fetch')) {
-          toast('Check your internet connection and refresh the page.', {
-            icon: '🌐',
-            duration: 5000
-          });
-        }
-      } else {
-        console.log('Database connection successful:', connectionStatus);
-        // Optional success message for debugging
-        if (import.meta.env.DEV) {
-          toast.success(`Connected to database. Response time: ${connectionStatus.responseTime}ms`, {
-            duration: 3000
-          });
-        }
-      }
-    };
+  // Helper function to generate mock data
+  const generateMockData = () => {
+    // Generate mock trending resources
+    const mockTrending = Array(6).fill().map((_, i) => ({
+      id: `mock-trending-${i}`,
+      title: `Trending Resource ${i+1}`,
+      description: 'This is a mock resource for local data mode',
+      url: 'https://example.com',
+      image_url: `https://picsum.photos/seed/trending${i}/300/200`,
+      category: Object.keys(INITIAL_CATEGORIES)[i % Object.keys(INITIAL_CATEGORIES).length],
+      subcategory: Object.values(INITIAL_CATEGORIES)[0].subcategories[i % Object.values(INITIAL_CATEGORIES)[0].subcategories.length].id,
+      tags: 'mock,local,design',
+      likes: Math.floor(Math.random() * 100),
+      created_at: new Date(Date.now() - Math.floor(Math.random() * 30) * 24 * 60 * 60 * 1000).toISOString()
+    }));
     
-    checkConnection();
+    // Generate mock recent resources
+    const mockRecent = Array(6).fill().map((_, i) => ({
+      id: `mock-recent-${i}`,
+      title: `Recent Resource ${i+1}`,
+      description: 'This is a mock resource for local data mode',
+      url: 'https://example.com',
+      image_url: `https://picsum.photos/seed/recent${i}/300/200`,
+      category: Object.keys(INITIAL_CATEGORIES)[i % Object.keys(INITIAL_CATEGORIES).length],
+      subcategory: Object.values(INITIAL_CATEGORIES)[1].subcategories[i % Object.values(INITIAL_CATEGORIES)[1].subcategories.length].id,
+      tags: 'mock,local,design',
+      likes: Math.floor(Math.random() * 100),
+      created_at: new Date(Date.now() - Math.floor(Math.random() * 10) * 24 * 60 * 60 * 1000).toISOString()
+    }));
     
-    // Don't run the connection check again due to state updates
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    // Generate mock popular resources
+    const mockPopular = Array(6).fill().map((_, i) => ({
+      id: `mock-popular-${i}`,
+      title: `Popular Resource ${i+1}`,
+      description: 'This is a mock resource for local data mode',
+      url: 'https://example.com',
+      image_url: `https://picsum.photos/seed/popular${i}/300/200`,
+      category: Object.keys(INITIAL_CATEGORIES)[i % Object.keys(INITIAL_CATEGORIES).length],
+      subcategory: Object.values(INITIAL_CATEGORIES)[2].subcategories[i % Object.values(INITIAL_CATEGORIES)[2].subcategories.length].id,
+      tags: 'mock,local,design',
+      likes: Math.floor(Math.random() * 100) + 50,
+      created_at: new Date(Date.now() - Math.floor(Math.random() * 60) * 24 * 60 * 60 * 1000).toISOString()
+    }));
+    
+    // Generate mock most liked resources
+    const mockMostLiked = Array(6).fill().map((_, i) => ({
+      id: `mock-most-liked-${i}`,
+      title: `Most Liked Resource ${i+1}`,
+      description: 'This is a highly liked mock resource',
+      url: 'https://example.com',
+      image_url: `https://picsum.photos/seed/liked${i}/300/200`,
+      category: Object.keys(INITIAL_CATEGORIES)[i % Object.keys(INITIAL_CATEGORIES).length],
+      subcategory: Object.values(INITIAL_CATEGORIES)[3].subcategories[i % Object.values(INITIAL_CATEGORIES)[3].subcategories.length].id,
+      tags: 'mock,local,popular,favorite',
+      likes: Math.floor(Math.random() * 50) + 150, // Higher likes count
+      created_at: new Date(Date.now() - Math.floor(Math.random() * 90) * 24 * 60 * 60 * 1000).toISOString()
+    }));
+    
+    // Set the mock data
+    setTrendingResources(mockTrending);
+    setRecentResources(mockRecent);
+    setPopularResources(mockPopular);
+    setMostLikedResources(mockMostLiked);
+    
+    // Generate mock category counts
+    const updatedCategories = {};
+    Object.entries(INITIAL_CATEGORIES).forEach(([key, category]) => {
+      updatedCategories[key] = {
+        ...category,
+        count: Math.floor(Math.random() * 20) + 5,
+        subcategories: category.subcategories.map(sub => ({
+          ...sub,
+          count: Math.floor(Math.random() * 10) + 2
+        }))
+      };
+    });
+    setCategories(updatedCategories);
+    
+    // Generate mock software counts
+    const updatedSoftware = INITIAL_SOFTWARE_CATEGORIES.map(software => ({
+      ...software,
+      count: Math.floor(Math.random() * 15) + 3
+    }));
+    setSoftwareCategories(updatedSoftware);
+  };
 
   // Fetch counts for all categories and subcategories
   const fetchCategoryCounts = useCallback(async () => {
@@ -320,25 +373,66 @@ const HomePage = () => {
   const fetchResources = useCallback(async () => {
     if (!isBrowser) return;
     
+    // Prevent multiple fetches in the same render cycle
+    if (resourcesFetched.current) return;
+    resourcesFetched.current = true;
+    
     try {
       setLoading(true);
       
+      // Check if Supabase mode is forced
+      const forceSupabase = localStorage.getItem('forceSupabaseConnection');
+      
+      // If not in forced Supabase mode, use local data
+      if (forceSupabase === 'false') {
+        console.log('Using local data mode - loading mock resources');
+        // Generate mock data for local mode
+        generateMockData();
+        return;
+      }
+      
+      // Force Supabase mode if explicitly set
+      if (forceSupabase === 'true') {
+        console.log('Supabase mode is forced - attempting to connect');
+        localStorage.setItem('forceSupabaseConnection', 'true');
+        setIsSupabaseMode(true);
+      }
+      
       // First check if we can connect to the database
-      const isConnected = await checkSupabaseConnection();
+      // Skip this check if we've already checked in this render cycle
+      let isConnected = false;
+      if (!connectionChecked.current) {
+        connectionChecked.current = true;
+        isConnected = await checkSupabaseConnection();
+      } else {
+        // Use the cached connection status
+        isConnected = !connectionError;
+      }
       
       if (!isConnected) {
         console.error('Database connection failed. Using fallback data.');
         setConnectionError(true);
-        setLoading(false);
-        return;
+        
+        // Only use mock data if we're not forcing Supabase mode
+        if (forceSupabase !== 'true') {
+          generateMockData();
+          return;
+        }
+        
+        // If we're forcing Supabase mode, show an error and continue trying
+        toast.error('Failed to connect to Supabase but Supabase mode is forced. Check your configuration.', {
+          duration: 5000,
+          icon: '⚠️'
+        });
       }
       
       // Try to fetch resources
       try {
-        const [trendingData, recentData, popularData] = await Promise.all([
+        const [featuredData, recentData, topRatedData, mostLikedData] = await Promise.all([
           supabase.from('resources')
             .select('*')
-            .order('popularity', { ascending: false })
+            .eq('featured', true)  // Only get featured resources
+            .order('created_at', { ascending: false })
             .limit(6),
             
           supabase.from('resources')
@@ -348,21 +442,58 @@ const HomePage = () => {
             
           supabase.from('resources')
             .select('*')
-            .order('popularity', { ascending: false })
-            .limit(6)
+            .order('created_at', { ascending: false })
+            .limit(6),
+            
+          // Custom query to get most liked resources - fix by using try/catch instead of .catch()
+          (async () => {
+            try {
+              // First try the new v2 function
+              return await supabase.rpc('get_most_liked_resources_v2', { limit_count: 6 });
+            } catch (rpcErrorV2) {
+              console.log('V2 function not available, trying original function:', rpcErrorV2);
+              
+              // Try the original function
+              try {
+                return await supabase.rpc('get_most_liked_resources', { limit_count: 6 });
+              } catch (rpcError) {
+                // If both RPC functions fail, fall back to a more basic query
+                console.log('Falling back to basic favorites count query, both RPC functions failed:', rpcError);
+                
+                // Try to get resources with a join to count favorites
+                try {
+                  return await supabase.from('resources')
+                    .select('*, favorite_count:favorites!resource_id(count)')
+                    .order('created_at', { ascending: false })
+                    .limit(6);
+                } catch (joinError) {
+                  // If even the join fails, just get resources sorted by created_at
+                  console.log('Join query failed, using simple query:', joinError);
+                  return await supabase.from('resources')
+                    .select('*')
+                    .order('created_at', { ascending: false })
+                    .limit(6);
+                }
+              }
+            }
+          })()
         ]);
 
         // Check for errors in each query
-        if (trendingData.error) {
-          console.error('Error fetching trending resources:', trendingData.error);
-          if (trendingData.error.code === '42P01') {
+        if (featuredData.error) {
+          console.error('Error fetching featured resources:', featuredData.error);
+          if (featuredData.error.code === '42P01') {
             // Table doesn't exist, use empty array
             setTrendingResources([]);
+            toast.error('Resources table does not exist. Please create it first.', {
+              duration: 5000,
+              icon: '⚠️'
+            });
           } else {
-            throw trendingData.error;
+            throw featuredData.error;
           }
         } else {
-          setTrendingResources(trendingData.data || []);
+          setTrendingResources(featuredData.data || []);
         }
 
         if (recentData.error) {
@@ -377,16 +508,23 @@ const HomePage = () => {
           setRecentResources(recentData.data || []);
         }
 
-        if (popularData.error) {
-          console.error('Error fetching popular resources:', popularData.error);
-          if (popularData.error.code === '42P01') {
+        if (topRatedData.error) {
+          console.error('Error fetching top rated resources:', topRatedData.error);
+          if (topRatedData.error.code === '42P01') {
             // Table doesn't exist, use empty array
             setPopularResources([]);
           } else {
-            throw popularData.error;
+            throw topRatedData.error;
           }
         } else {
-          setPopularResources(popularData.data || []);
+          setPopularResources(topRatedData.data || []);
+        }
+        
+        if (mostLikedData.error) {
+          console.error('Error fetching most liked resources:', mostLikedData.error);
+          setMostLikedResources([]);
+        } else {
+          setMostLikedResources(mostLikedData.data || []);
         }
         
         // Try to fetch category and software counts
@@ -399,9 +537,11 @@ const HomePage = () => {
           console.error('Error fetching counts:', countsError);
           // Continue with what we have
         }
+        
+        // If we got here without errors, clear the connection error flag
+        setConnectionError(false);
       } catch (resourcesError) {
         console.error('Error fetching resources:', resourcesError);
-        setConnectionError(true);
         
         // Check for API key errors and provide more helpful message
         if (resourcesError.message?.includes('No API key found') || 
@@ -411,37 +551,225 @@ const HomePage = () => {
             duration: 5000,
             icon: '🔑'
           });
-          
-          // Log more debug information
-          console.log('Supabase URL:', supabaseUrl);
-          console.log('API Key length:', supabaseAnonKey ? supabaseAnonKey.length : 0);
-          console.log('API Key first 10 chars:', supabaseAnonKey ? supabaseAnonKey.substring(0, 10) + '...' : 'undefined');
+          setConnectionError(true);
         }
         
-        // Use empty arrays for resources
-        setTrendingResources([]);
-        setRecentResources([]);
-        setPopularResources([]);
+        // Check for network errors
+        if (resourcesError.message?.includes('Failed to fetch')) {
+          toast.error('Network error. Check your internet connection.', {
+            duration: 5000,
+            icon: '🌐'
+          });
+          setConnectionError(true);
+        }
+        
+        // Use mock data on error only if not forcing Supabase mode
+        if (forceSupabase !== 'true') {
+          generateMockData();
+        } else {
+          // If forcing Supabase mode, show empty state
+          setTrendingResources([]);
+          setRecentResources([]);
+          setPopularResources([]);
+          toast.error('Error fetching resources and Supabase mode is forced. Check console for details.', {
+            duration: 5000,
+            icon: '⚠️'
+          });
+        }
       }
     } catch (error) {
       console.error('Error in fetchResources:', error);
       setConnectionError(true);
+      
+      // Use mock data on error only if not forcing Supabase mode
+      const forceSupabase = localStorage.getItem('forceSupabaseConnection');
+      if (forceSupabase !== 'true') {
+        generateMockData();
+      } else {
+        // If forcing Supabase mode, show empty state
+        setTrendingResources([]);
+        setRecentResources([]);
+        setPopularResources([]);
+      }
     } finally {
       setLoading(false);
     }
-  }, [isBrowser, fetchCategoryCounts, fetchSoftwareCounts]);
-
-  // Update useEffect dependencies
-  useEffect(() => {
-    fetchResources();
-  }, [fetchResources, currentLanguage]); // Add currentLanguage dependency
+  }, [isBrowser, fetchCategoryCounts, fetchSoftwareCounts, connectionError]);
   
+  // Toggle Supabase connection mode
+  const toggleSupabaseMode = useCallback(() => {
+    const newMode = !isSupabaseMode;
+    setIsSupabaseMode(newMode);
+    localStorage.setItem('forceSupabaseConnection', newMode.toString());
+    
+    if (newMode) {
+      toast.success('Supabase mode enabled. The app will use live data.');
+      // Reload data from Supabase
+      setLoading(true);
+      // Reset the fetched flag to allow fetching again
+      resourcesFetched.current = false;
+      connectionChecked.current = false;
+      fetchResources();
+    } else {
+      toast.success('Local data mode enabled. Connection checks disabled for performance.');
+      // Data will be reloaded with mock data on next render
+      setLoading(true);
+      // Reset the fetched flag to allow fetching again
+      resourcesFetched.current = false;
+      connectionChecked.current = false;
+      fetchResources();
+    }
+  }, [isSupabaseMode, fetchResources]);
+  
+  // Get flattened subcategories
+  const subcategories = Object.values(categories).flatMap(category => category.subcategories);
+  
+  // Check database connection on mount
+  useEffect(() => {
+    const checkConnection = async () => {
+      // Prevent multiple connection checks in the same render cycle
+      if (connectionChecked.current) return;
+      connectionChecked.current = true;
+      
+      // Skip connection check if local mode is explicitly set
+      const forceSupabase = localStorage.getItem('forceSupabaseConnection');
+      if (forceSupabase === 'false') {
+        console.log('Local mode is enabled, skipping connection check');
+        setConnectionError(true); // Treat as disconnected for UI purposes
+        return;
+      }
+      
+      try {
+        const isConnected = await checkSupabaseConnection();
+        
+        if (!isConnected) {
+          console.error('Database connection failed');
+          setConnectionError(true);
+          
+          toast.error('Database connection failed. Using fallback data.', {
+            duration: 5000 // Show for longer to make sure user sees it
+          });
+        } else {
+          console.log('Database connection successful');
+          setConnectionError(false);
+          
+          // Optional success message for debugging
+          if (import.meta.env.DEV) {
+            toast.success('Connected to database successfully', {
+              duration: 3000
+            });
+          }
+        }
+      } catch (error) {
+        console.error('Error checking connection:', error);
+        setConnectionError(true);
+        
+        // Show more detailed toast with the actual error
+        toast.error(`Connection error: ${error.message}. Using fallback data.`, {
+          duration: 5000
+        });
+        
+        // If this is a network error, show a different message
+        if (error.message?.includes('Failed to fetch')) {
+          toast('Check your internet connection and refresh the page.', {
+            icon: '🌐',
+            duration: 5000
+          });
+        }
+      }
+    };
+    
+    checkConnection();
+    
+    // Cleanup function to reset the connection checked flag
+    return () => {
+      connectionChecked.current = false;
+    };
+    
+    // Don't run the connection check again due to state updates
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Define applyFilters with useCallback before it's used in useEffect
+  const applyFilters = useCallback((filters = selectedFilters) => {
+    const params = new URLSearchParams();
+    
+    // We use filter: true parameter to indicate that filters are being applied
+    // This helps distinguish from regular navigation
+    params.set('filter', 'true');
+    
+    // Handle category filter
+    if (filters.category) {
+      // For category, we'll use it in the path rather than as a query parameter
+      const categoryPath = filters.category;
+      
+      // If we also have a subcategory, add it as a query parameter
+      if (filters.subcategory) {
+        params.set('subcategory', filters.subcategory);
+      }
+      
+      // If we also have a software filter, add it as a query parameter
+      if (filters.software) {
+        params.set('tag', `software:${filters.software}`);
+      }
+      
+      // Navigate to the category page with filters
+      navigate(`/category/${categoryPath}?${params.toString()}`);
+    } 
+    // Handle subcategory filter without category
+    else if (filters.subcategory) {
+      // For subcategory without category, we'll go to 'all' category
+      const subcategoryParam = filters.subcategory;
+      params.set('subcategory', subcategoryParam);
+      
+      // If we also have a software filter, add it as a query parameter
+      if (filters.software) {
+        params.set('tag', `software:${filters.software}`);
+      }
+      
+      // Navigate to the all category page with subcategory filter
+      navigate(`/category/all?${params.toString()}`);
+    }
+    // Handle software filter without category or subcategory
+    else if (filters.software) {
+      // For software without category or subcategory, we'll use tag filter
+      const softwareTag = `software:${filters.software}`;
+      params.set('tag', softwareTag);
+      
+      // Navigate to the all category page with software tag filter
+      navigate(`/category/all?${params.toString()}`);
+    }
+  }, [selectedFilters, navigate]);
+
+  // Update useEffect dependencies and add a cleanup function
+  useEffect(() => {
+    // Only fetch resources on first mount, not on every fetchResources change
+    if (!resourcesFetched.current) {
+      // Add a small delay to prevent concurrent requests on page load
+      const timer = setTimeout(() => {
+        fetchResources();
+      }, 500);
+      
+      return () => {
+        clearTimeout(timer);
+        resourcesFetched.current = false;
+      };
+    }
+  }, []); // Empty dependency array - only run on mount
+  
+  // Add manual refresh function
+  const handleManualRefresh = () => {
+    resourcesFetched.current = false;
+    setLoading(true);
+    fetchResources();
+  };
+
   // Apply filters whenever they change
   useEffect(() => {
     if (Object.values(selectedFilters).some(Boolean)) {
       applyFilters();
     }
-  }, [selectedFilters]);
+  }, [selectedFilters, applyFilters]);
   
   // Handle search input change
   const handleSearchChange = (e) => {
@@ -520,49 +848,6 @@ const HomePage = () => {
       const newDisplay = { ...selectedFilterDisplay };
       delete newDisplay[type];
       setSelectedFilterDisplay(newDisplay);
-    }
-  };
-  
-  // Apply filters
-  const applyFilters = (filters = selectedFilters) => {
-    const params = new URLSearchParams();
-    
-    // We use filter: true parameter to indicate that filters are being applied
-    // This helps distinguish from regular navigation
-    params.set('filter', 'true');
-    
-    // Handle category filter
-    if (filters.category) {
-      // For category, we'll use it in the path rather than as a query parameter
-      const categoryPath = filters.category;
-      
-      // Add subcategory as a query parameter if present
-      if (filters.subcategory) {
-        params.set('subcategory', filters.subcategory);
-      }
-      
-      // Add software as a tag parameter if present
-      if (filters.software) {
-        params.set('tag', filters.software);
-      }
-      
-      // Navigate to category page with appropriate parameters
-      navigate(`/category/${categoryPath}?${params.toString()}`);
-    } else {
-      // If no category is selected, we use the 'all' category
-      
-      // Add subcategory as a query parameter if present
-      if (filters.subcategory) {
-        params.set('subcategory', filters.subcategory);
-      }
-      
-      // Add software as a tag parameter if present
-      if (filters.software) {
-        params.set('tag', filters.software);
-      }
-      
-      // Navigate to 'all' category with appropriate parameters
-      navigate(`/category/all?${params.toString()}`);
     }
   };
   
@@ -662,6 +947,27 @@ const HomePage = () => {
             <p className="text-lg text-gray-300 mb-8 drop-shadow-sm">
               {t('home.hero.subtitle', 'Find the best tools, assets, and inspiration for designers, developers, and creators.')}
             </p>
+            
+            {/* Data Mode Toggle */}
+            <div className="mb-4 flex justify-center">
+              <button
+                onClick={toggleSupabaseMode}
+                className={`px-4 py-2 rounded-full text-sm font-medium transition-colors ${
+                  isSupabaseMode 
+                    ? 'bg-[#bfff58]/20 text-[#bfff58] hover:bg-[#bfff58]/30' 
+                    : 'bg-gray-700/50 text-gray-300 hover:bg-gray-700/70'
+                }`}
+              >
+                {isSupabaseMode 
+                  ? 'Using Supabase Data 🔄' 
+                  : 'Using Local Data 📊'}
+              </button>
+              {connectionError && isSupabaseMode && (
+                <div className="ml-2 px-3 py-2 bg-red-500/20 text-red-300 rounded-full text-xs flex items-center">
+                  <span>Connection Error</span>
+                </div>
+              )}
+            </div>
             
             {/* Search Bar */}
             <div className="relative max-w-2xl mx-auto mb-8">
@@ -875,18 +1181,18 @@ const HomePage = () => {
         </div>
       </section>
       
-      <SectionDivider label={t('home.sections.trendingResources', 'Trending Resources')} />
+      <SectionDivider label={t('home.sections.highlightedResources', 'Highlighted Resources')} />
       
-      {/* Trending Resources */}
+      {/* Highlighted Resources (formerly Trending Resources) */}
       {trendingResources.length > 0 && (
         <section className="py-12">
           <div className="container mx-auto px-4">
             <div className="flex items-center mb-6">
               <h2 className="text-2xl font-bold text-white flex items-center">
                 <FireIcon className="w-6 h-6 mr-2 text-[#bfff58]" />
-                {t('home.sections.trendingResources', 'Trending Resources')}
+                {t('home.sections.highlightedResources', 'Highlighted Resources')}
               </h2>
-              <Link to="/category/all?sort=trending" className="ml-auto text-sm text-[#bfff58] hover:underline flex items-center">
+              <Link to="/category/all?sort=featured" className="ml-auto text-sm text-[#bfff58] hover:underline flex items-center">
                 {t('common.viewAll', 'View all')} <ChevronRightIcon className="w-4 h-4 ml-1" />
               </Link>
             </div>
@@ -935,22 +1241,51 @@ const HomePage = () => {
       
       <SectionDivider />
       
-      {/* Most Liked Resources */}
+      {/* Featured Resources (formerly Most Liked Resources) */}
       {popularResources.length > 0 && (
         <section className="py-12">
           <div className="container mx-auto px-4">
             <div className="flex items-center mb-6">
               <h2 className="text-2xl font-bold text-white flex items-center">
                 <HeartIcon className="w-6 h-6 mr-2 text-[#bfff58]" />
-                {t('home.sections.mostLiked', 'Most Liked Resources')}
+                {t('home.sections.featuredResources', 'Featured Resources')}
               </h2>
-              <Link to="/category/all?sort=popular" className="ml-auto text-sm text-[#bfff58] hover:underline flex items-center">
+              <Link to="/category/all?sort=featured" className="ml-auto text-sm text-[#bfff58] hover:underline flex items-center">
                 {t('common.viewAll', 'View all')} <ChevronRightIcon className="w-4 h-4 ml-1" />
               </Link>
             </div>
             
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
               {popularResources.map((resource, index) => (
+                <ResourceCard 
+                  key={resource.id} 
+                  resource={resource} 
+                  delay={index * 0.1}
+                />
+              ))}
+            </div>
+          </div>
+        </section>
+      )}
+      
+      <SectionDivider />
+      
+      {/* Most Liked Resources - New Section */}
+      {mostLikedResources.length > 0 && (
+        <section className="py-12 bg-dark-200/30">
+          <div className="container mx-auto px-4">
+            <div className="flex items-center mb-6">
+              <h2 className="text-2xl font-bold text-white flex items-center">
+                <HeartSolidIcon className="w-6 h-6 mr-2 text-red-500" />
+                {t('home.sections.mostLikedResources', 'Most Liked Resources')}
+              </h2>
+              <Link to="/category/all?sort=likes" className="ml-auto text-sm text-[#bfff58] hover:underline flex items-center">
+                {t('common.viewAll', 'View all')} <ChevronRightIcon className="w-4 h-4 ml-1" />
+              </Link>
+            </div>
+            
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
+              {mostLikedResources.map((resource, index) => (
                 <ResourceCard 
                   key={resource.id} 
                   resource={resource} 
@@ -977,3 +1312,4 @@ const HomePage = () => {
 };
 
 export default HomePage;
+

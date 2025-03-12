@@ -1,7 +1,7 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useLocation, useNavigate, Link } from 'react-router-dom';
 import { motion } from 'framer-motion';
-import { supabase } from '../main';
+import supabase from '../utils/supabase';
 import { useLanguage } from '../context/LanguageContext';
 import SearchBar from '../components/SearchBar';
 import FilterTags from '../components/FilterTags';
@@ -24,7 +24,12 @@ const CategoryPage = () => {
   const [subcategories, setSubcategories] = useState([]);
   const [page, setPage] = useState(0);
   const [hasMore, setHasMore] = useState(true);
+  const [error, setError] = useState(null);
   const ITEMS_PER_PAGE = 12;
+  
+  // Add refs to track if operations have been performed
+  const dataFetched = useRef(false);
+  const resourceCache = useRef({});
   
   // Parse query parameters
   useEffect(() => {
@@ -61,14 +66,39 @@ const CategoryPage = () => {
     setPage(0);
     setResources([]);
     setHasMore(true);
+    setError(null);
+    dataFetched.current = false;
     
     // Fetch data with the new filters
     fetchData();
   }, [location.search, category]);
   
-  const fetchData = async () => {
+  // Memoize fetchData to prevent recreation on each render
+  const fetchData = useCallback(async () => {
+    // Prevent multiple fetches in the same render cycle
+    if (dataFetched.current) return;
+    dataFetched.current = true;
+    
     try {
       setLoading(true);
+      setError(null);
+      
+      // Generate cache key based on current filters
+      const urlParams = new URLSearchParams(location.search);
+      const cacheKey = `${category}_${urlParams.toString()}_${page}`;
+      
+      // Check if we have cached data for this query
+      if (resourceCache.current[cacheKey]) {
+        console.log('Using cached data for', cacheKey);
+        const cachedData = resourceCache.current[cacheKey];
+        setCategoryData(cachedData.categoryData);
+        setResources(cachedData.resources);
+        setAllTags(cachedData.allTags);
+        setSubcategories(cachedData.subcategories);
+        setHasMore(cachedData.hasMore);
+        setLoading(false);
+        return;
+      }
       
       // Fetch category data if not 'all'
       if (category !== 'all') {
@@ -78,10 +108,22 @@ const CategoryPage = () => {
           .select('*')
           .eq('slug', category);
           
-        if (catError) throw catError;
-        
-        // Set category data if found, otherwise create a default one based on the slug
-        if (catData && catData.length > 0) {
+        if (catError) {
+          console.error('Error fetching category data:', catError);
+          // Handle specific error types
+          if (catError.code === '42P01') {
+            console.warn('Categories table does not exist');
+          } else if (catError.code === 'PGRST301') {
+            console.warn('Invalid category slug format');
+          }
+          
+          // Create a default category based on the slug
+          setCategoryData({
+            name: t(`categories.${category}`, category.charAt(0).toUpperCase() + category.slice(1)),
+            description: t('categories.description', 'Browse our curated collection of {category} resources', { category: t(`categories.${category}`, category) }),
+            slug: category
+          });
+        } else if (catData && catData.length > 0) {
           setCategoryData(catData[0]);
         } else {
           // Create a default category object based on the slug
@@ -93,8 +135,60 @@ const CategoryPage = () => {
         }
       }
       
+      // Check if Supabase mode is forced
+      const forceSupabase = localStorage.getItem('forceSupabaseConnection') === 'true';
+      
+      if (!forceSupabase) {
+        // Generate mock data for local mode
+        console.log('Using local data mode - loading mock resources');
+        const mockResources = Array(ITEMS_PER_PAGE).fill().map((_, i) => ({
+          id: `mock-${category}-${i}`,
+          title: `${category.charAt(0).toUpperCase() + category.slice(1)} Resource ${i+1}`,
+          description: 'This is a mock resource for local data mode',
+          url: 'https://example.com',
+          image_url: `https://picsum.photos/seed/${category}${i}/300/200`,
+          category: category,
+          subcategory: selectedSubcategory || `subcategory-${i % 3}`,
+          tags: selectedTags.length > 0 ? selectedTags.join(',') : 'mock,local,design',
+          likes: Math.floor(Math.random() * 100),
+          created_at: new Date(Date.now() - Math.floor(Math.random() * 30) * 24 * 60 * 60 * 1000).toISOString()
+        }));
+        
+        // Extract all unique tags from resources
+        const tags = new Set();
+        mockResources.forEach(resource => {
+          if (resource.tags) {
+            resource.tags.split(',').forEach(tag => tags.add(tag.trim()));
+          }
+        });
+        
+        // Extract all unique subcategories
+        const subCats = new Set();
+        mockResources.forEach(resource => {
+          if (resource.subcategory) {
+            subCats.add(resource.subcategory);
+          }
+        });
+        
+        setAllTags(Array.from(tags));
+        setSubcategories(Array.from(subCats));
+        setResources(mockResources);
+        setHasMore(page < 2); // Only show 3 pages of mock data
+        
+        // Cache the results
+        resourceCache.current[cacheKey] = {
+          categoryData: categoryData,
+          resources: mockResources,
+          allTags: Array.from(tags),
+          subcategories: Array.from(subCats),
+          hasMore: page < 2
+        };
+        
+        setLoading(false);
+        return;
+      }
+      
       // Parse URL parameters
-      const urlParams = new URLSearchParams(location.search);
       const urlSearchQuery = urlParams.get('search');
       const urlTagQuery = urlParams.get('tag');
       const urlSubcategoryQuery = urlParams.get('subcategory');
@@ -134,51 +228,87 @@ const CategoryPage = () => {
       
       const { data: resourcesData, error: resourcesError } = await query;
       
-      if (resourcesError) throw resourcesError;
-      
-      if (resourcesData.length < ITEMS_PER_PAGE) {
-        setHasMore(false);
-      }
-      
-      // For multiple tags, we need to filter in memory
-      let filteredResources = resourcesData;
-      if (urlTagQuery) {
-        const tags = urlTagQuery.split(',').map(tag => tag.trim()).filter(Boolean);
+      if (resourcesError) {
+        console.error('Error fetching resources:', resourcesError);
         
-        if (tags.length > 1) {
-          filteredResources = resourcesData.filter(resource => {
-            // Check if resource has all the selected tags
-            return tags.every(tag => resource.tags && resource.tags.includes(tag));
-          });
+        // Handle specific error types
+        if (resourcesError.code === '42P01') {
+          setError('Resources table does not exist. Please check your database setup.');
+        } else if (resourcesError.code === 'PGRST301') {
+          setError('Invalid query format. Please check your filters.');
+        } else if (resourcesError.message?.includes('Failed to fetch')) {
+          setError('Network error. Please check your internet connection.');
+        } else {
+          setError('Failed to load resources. Please try again later.');
         }
+        
+        toast.error(t('common.error.loading', 'Failed to load resources'));
+        setResources([]);
+        setHasMore(false);
+      } else {
+        if (resourcesData.length < ITEMS_PER_PAGE) {
+          setHasMore(false);
+        }
+        
+        // For multiple tags, we need to filter in memory
+        let filteredResources = resourcesData || [];
+        if (urlTagQuery) {
+          const tags = urlTagQuery.split(',').map(tag => tag.trim()).filter(Boolean);
+          
+          if (tags.length > 1) {
+            filteredResources = resourcesData.filter(resource => {
+              // Check if resource has all the selected tags
+              return tags.every(tag => resource.tags && 
+                (Array.isArray(resource.tags) 
+                  ? resource.tags.includes(tag)
+                  : resource.tags.split(',').map(t => t.trim()).includes(tag)
+                )
+              );
+            });
+          }
+        }
+        
+        // Extract all unique tags from resources
+        const tags = new Set();
+        resourcesData.forEach(resource => {
+          if (resource.tags) {
+            if (Array.isArray(resource.tags)) {
+              resource.tags.forEach(tag => tags.add(tag));
+            } else {
+              resource.tags.split(',').forEach(tag => tags.add(tag.trim()));
+            }
+          }
+        });
+        
+        // Extract all unique subcategories
+        const subCats = new Set();
+        resourcesData.forEach(resource => {
+          if (resource.subcategory) {
+            subCats.add(resource.subcategory);
+          }
+        });
+        
+        setAllTags(Array.from(tags));
+        setSubcategories(Array.from(subCats));
+        setResources(filteredResources);
+        
+        // Cache the results
+        resourceCache.current[cacheKey] = {
+          categoryData: categoryData,
+          resources: filteredResources,
+          allTags: Array.from(tags),
+          subcategories: Array.from(subCats),
+          hasMore: resourcesData.length >= ITEMS_PER_PAGE
+        };
       }
-      
-      // Extract all unique tags from resources
-      const tags = new Set();
-      resourcesData.forEach(resource => {
-        if (resource.tags && Array.isArray(resource.tags)) {
-          resource.tags.forEach(tag => tags.add(tag));
-        }
-      });
-      
-      // Extract all unique subcategories
-      const subCats = new Set();
-      resourcesData.forEach(resource => {
-        if (resource.subcategory) {
-          subCats.add(resource.subcategory);
-        }
-      });
-      
-      setAllTags(Array.from(tags));
-      setSubcategories(Array.from(subCats));
-      setResources(filteredResources);
     } catch (error) {
       console.error('Error fetching data:', error);
+      setError('An unexpected error occurred. Please try again later.');
       toast.error(t('common.error.loading', 'Failed to load resources'));
     } finally {
       setLoading(false);
     }
-  };
+  }, [category, location.search, page, t, categoryData]);
   
   const loadMore = async () => {
     if (!hasMore || loading) return;
@@ -186,95 +316,11 @@ const CategoryPage = () => {
     const nextPage = page + 1;
     setPage(nextPage);
     
-    try {
-      setLoading(true);
-      
-      // Parse URL parameters
-      const urlParams = new URLSearchParams(location.search);
-      const urlSearchQuery = urlParams.get('search');
-      const urlTagQuery = urlParams.get('tag');
-      const urlSubcategoryQuery = urlParams.get('subcategory');
-      
-      // Fetch next page of resources
-      let query = supabase
-        .from('resources')
-        .select('*');
-      
-      // Apply category filter
-      if (category !== 'all') {
-        query = query.eq('category', category);
-      }
-      
-      // Apply search query filter if present
-      if (urlSearchQuery) {
-        query = query.or(`title.ilike.%${urlSearchQuery}%,description.ilike.%${urlSearchQuery}%`);
-      }
-      
-      // Apply subcategory filter if present
-      if (urlSubcategoryQuery) {
-        query = query.eq('subcategory', urlSubcategoryQuery);
-      }
-      
-      // Apply tag filtering at the database level if possible
-      if (urlTagQuery) {
-        const tags = urlTagQuery.split(',').map(tag => tag.trim()).filter(Boolean);
-        if (tags.length === 1) {
-          // For single tag, we can use contains in the query
-          query = query.contains('tags', [tags[0]]);
-        }
-      }
-      
-      // Add pagination
-      query = query.range(nextPage * ITEMS_PER_PAGE, (nextPage * ITEMS_PER_PAGE) + ITEMS_PER_PAGE - 1);
-      
-      const { data: newResources, error } = await query;
-      
-      if (error) throw error;
-      
-      if (newResources.length < ITEMS_PER_PAGE) {
-        setHasMore(false);
-      }
-      
-      // For multiple tags, we need to filter in memory
-      let filteredNewResources = newResources;
-      if (urlTagQuery) {
-        const tags = urlTagQuery.split(',').map(tag => tag.trim()).filter(Boolean);
-        
-        if (tags.length > 1) {
-          filteredNewResources = newResources.filter(resource => {
-            // Check if resource has all the selected tags
-            return tags.every(tag => resource.tags && resource.tags.includes(tag));
-          });
-        }
-      }
-      
-      // Add new resources to existing ones
-      setResources(prev => [...prev, ...filteredNewResources]);
-      
-      // Extract and add new tags
-      const newTags = new Set();
-      newResources.forEach(resource => {
-        if (resource.tags && Array.isArray(resource.tags)) {
-          resource.tags.forEach(tag => newTags.add(tag));
-        }
-      });
-      
-      // Extract and add new subcategories
-      const newSubcats = new Set();
-      newResources.forEach(resource => {
-        if (resource.subcategory) {
-          newSubcats.add(resource.subcategory);
-        }
-      });
-      
-      setAllTags(prev => Array.from(new Set([...prev, ...Array.from(newTags)])));
-      setSubcategories(prev => Array.from(new Set([...prev, ...Array.from(newSubcats)])));
-    } catch (error) {
-      console.error('Error loading more resources:', error);
-      toast.error('Failed to load more resources');
-    } finally {
-      setLoading(false);
-    }
+    // Reset the fetched flag to allow fetching the next page
+    dataFetched.current = false;
+    
+    // Fetch data for the next page
+    fetchData();
   };
   
   // Handle tag toggle
@@ -485,12 +531,25 @@ const CategoryPage = () => {
         <div className="flex justify-center items-center py-12">
           <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-[#bfff58]"></div>
         </div>
+      ) : error ? (
+        <div className="text-center py-12">
+          <div className="glass-card p-6 max-w-lg mx-auto">
+            <h3 className="text-xl font-medium text-red-400 mb-3">Error Loading Resources</h3>
+            <p className="text-gray-300 mb-4">{error}</p>
+            <button 
+              onClick={clearFilters}
+              className="px-4 py-2 bg-[rgba(255,255,255,0.1)] hover:bg-[rgba(255,255,255,0.2)] rounded-full text-white text-sm transition-colors"
+            >
+              Clear Filters & Try Again
+            </button>
+          </div>
+        </div>
       ) : resources.length > 0 ? (
         <>
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
             {resources.map((resource, index) => (
               <ResourceCard 
-                key={resource.id} 
+                key={`${resource.id}-${index}`} 
                 resource={resource} 
                 delay={index % 9} // Stagger animation in groups of 9
               />
@@ -502,8 +561,9 @@ const CategoryPage = () => {
               <button 
                 onClick={loadMore}
                 className="px-6 py-2 bg-[rgba(255,255,255,0.05)] hover:bg-[rgba(255,255,255,0.1)] rounded-full text-white transition-colors"
+                disabled={loading}
               >
-                Load More
+                {loading ? 'Loading...' : 'Load More'}
               </button>
             </div>
           )}

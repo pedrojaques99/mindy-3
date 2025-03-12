@@ -1,4 +1,4 @@
-import { supabase } from '../main';
+import supabase from './supabase';
 
 // Fallback translations in case database fails
 export const FALLBACK_TRANSLATIONS = {

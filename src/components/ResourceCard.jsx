@@ -1,8 +1,8 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { HeartIcon, ShareIcon, ExternalLinkIcon, ChatAltIcon } from '@heroicons/react/outline';
 import { HeartIcon as HeartSolidIcon } from '@heroicons/react/solid';
-import { supabase } from '../main';
+import supabase from '../utils/supabase';
 import { useUser } from '../context/UserContext';
 import { useLanguage } from '../context/LanguageContext';
 import toast from 'react-hot-toast';
@@ -11,10 +11,22 @@ import AutoThumbnail from './ui/AutoThumbnail';
 import SoftwareIcon from './ui/SoftwareIcon';
 import { getWebsiteThumbnail, getWebsiteFavicon } from '../utils/thumbnailUtils';
 
-export default function ResourceCard({ resource, delay = 0 }) {
+export default function ResourceCard({ resource: resourceProp, delay = 0 }) {
   const { user } = useUser();
   const { t } = useLanguage();
   const navigate = useNavigate();
+  
+  // Handle case where resource might be an array
+  const resource = Array.isArray(resourceProp) 
+    ? (resourceProp.length > 0 ? resourceProp[0] : null) 
+    : resourceProp;
+  
+  // Return early if no valid resource
+  if (!resource || !resource.id) {
+    console.error('Invalid resource data received in ResourceCard:', resourceProp);
+    return null;
+  }
+  
   const [isFavorited, setIsFavorited] = useState(resource?.favorited || false);
   const [isLoading, setIsLoading] = useState(false);
   const [imageLoaded, setImageLoaded] = useState(false);
@@ -22,128 +34,168 @@ export default function ResourceCard({ resource, delay = 0 }) {
   const [thumbnailUrl, setThumbnailUrl] = useState(resource.image_url || null);
   const [faviconUrl, setFaviconUrl] = useState(null);
   const [commentCount, setCommentCount] = useState(0);
+  
+  // Use refs to track if we've already performed certain operations
+  const commentsFetched = useRef(false);
+  const favoritesChecked = useRef(false);
+  const thumbnailsFetched = useRef(false);
+  const resourceIdRef = useRef(resource?.id);
 
   useEffect(() => {
-    // Check if resource is favorited
-    if (user && resource) {
+    // Only run this effect if the resource ID changes or on first mount
+    if (resourceIdRef.current !== resource?.id) {
+      resourceIdRef.current = resource?.id;
+      commentsFetched.current = false;
+      favoritesChecked.current = false;
+      thumbnailsFetched.current = false;
+    }
+    
+    // Check if resource is favorited - only if not already checked
+    if (user && resource?.id && !favoritesChecked.current) {
+      favoritesChecked.current = true;
       const checkFavorite = async () => {
-        const { data, error } = await supabase
-          .from('favorites')
-          .select()
-          .eq('user_id', user.id)
-          .eq('resource_id', resource.id)
-          .maybeSingle();
+        try {
+          console.log(`Checking favorite status for resource: ${resource.id} and user: ${user.id}`);
           
-        if (!error && data) {
-          setIsFavorited(true);
+          // Check if user has favorited this resource
+          const { data, error } = await supabase
+            .from('favorites')
+            .select('id')
+            .eq('user_id', user.id)
+            .eq('resource_id', resource.id)
+            .maybeSingle();
+          
+          if (error) throw error;
+          
+          // Set favorited state based on result
+          setIsFavorited(!!data);
+        } catch (err) {
+          console.error('Error checking favorite status:', err);
         }
       };
       
       checkFavorite();
     }
     
-    // Fetch comment count
-    fetchCommentCount();
-  }, [user, resource]);
-  
-  // Fetch comment count
-  const fetchCommentCount = async () => {
-    if (!resource?.id) return;
+    // Fetch comment count if not already fetched
+    if (resource?.id && !commentsFetched.current) {
+      commentsFetched.current = true;
+      const fetchCommentCount = async () => {
+        try {
+          // First check if the comments table exists by doing a lightweight query
+          const { error: tableCheckError } = await supabase
+            .from('comments')
+            .select('id', { count: 'exact', head: true })
+            .limit(1);
+          
+          // If there's a table-related error (like table not existing), just set count to 0 and exit
+          if (tableCheckError) {
+            console.log('Comments table may not exist yet, setting count to 0:', tableCheckError.message);
+            setCommentCount(0);
+            return;
+          }
+          
+          // If table exists, proceed with actual count query
+          const { count, error } = await supabase
+            .from('comments')
+            .select('*', { count: 'exact', head: true })
+            .eq('resource_id', resource.id);
+          
+          if (error) {
+            console.error('Error getting comment count:', error);
+            // Still set a default value to prevent UI issues
+            setCommentCount(0);
+            return;
+          }
+          
+          // Set the comment count from the result
+          setCommentCount(count || 0);
+        } catch (err) {
+          // Handle any unexpected errors
+          console.error('Exception fetching comment count:', err);
+          // Set a default value to prevent UI issues
+          setCommentCount(0);
+        }
+      };
+      
+      fetchCommentCount();
+    }
     
-    try {
-      // Try to connect to Supabase and fetch comment count
-      const { count, error } = await supabase
-        .from('comments')
-        .select('id', { count: 'exact' })
-        .eq('resource_id', resource.id);
-        
-      if (error) throw error;
+    // Get thumbnails if needed
+    if (!thumbnailsFetched.current && resource?.url) {
+      thumbnailsFetched.current = true;
       
-      setCommentCount(count || 0);
-    } catch (error) {
-      // More detailed error logging
-      console.error('Error fetching comment count:', {
-        message: error.message,
-        details: error.details,
-        hint: error.hint,
-        code: error.code
-      });
+      // Get thumbnail if no image_url
+      if (!resource.image_url) {
+        try {
+          // getWebsiteThumbnail returns a string directly, not a Promise
+          const thumbnailUrl = getWebsiteThumbnail(resource.url);
+          if (thumbnailUrl) {
+            setThumbnailUrl(thumbnailUrl);
+          }
+        } catch (err) {
+          console.error('Error fetching thumbnail:', err);
+          setImageError(true);
+        }
+      }
       
-      // Set default value when error occurs
-      setCommentCount(0);
-      
-      // Retry once after a short delay if it's a network error
-      if (error.message?.includes('Failed to fetch')) {
-        setTimeout(() => {
-          console.log('Retrying comment count fetch...');
-          retryFetchCommentCount();
-        }, 2000);
+      // Get favicon
+      try {
+        // getWebsiteFavicon is also synchronous
+        const favicon = getWebsiteFavicon(resource.url);
+        if (favicon) {
+          setFaviconUrl(favicon);
+        }
+      } catch (err) {
+        console.error('Error fetching favicon:', err);
       }
     }
-  };
-  
-  // Retry function with simplified approach
-  const retryFetchCommentCount = async () => {
-    if (!resource?.id) return;
-    
-    try {
-      const { count, error } = await supabase
-        .from('comments')
-        .select('id', { count: 'exact' })
-        .eq('resource_id', resource.id);
-        
-      if (error) throw error;
-      
-      setCommentCount(count || 0);
-    } catch (error) {
-      // Just log the retry failure, don't attempt again
-      console.error('Retry fetch comment count failed:', error);
-      // Keep the default count of 0
-    }
-  };
+  }, [resource, user]);
   
   // Track resource view
   const trackView = async () => {
     if (!user) return;
     
     try {
-      await supabase
+      // Try to use the resource_views table first
+      const { error } = await supabase
         .from('resource_views')
         .insert([
-          { resource_id: resource.id, user_id: user.id }
-        ], { 
-          headers: { 
-            'Content-Type': 'application/json',
-            'Accept': 'application/json' 
-          }
-        });
-        
-      // Update popularity
-      try {
-        await supabase.rpc('increment_popularity', { resource_id: resource.id });
-      } catch (error) {
-        console.error('Error incrementing popularity:', error);
+          { resource_id: resource.id, user_id: user.id, created_at: new Date().toISOString() }
+        ]);
+      
+      // If there's a permission error, just log it and continue
+      if (error && (error.code === '401' || error.code === '42501' || error.status === 401)) {
+        console.warn('View tracking disabled due to permissions');
+        return;
+      }
+      
+      if (error) {
+        console.warn(`Failed to track view for resource ${resource.id}:`, error);
+      } else {
+        console.log(`View tracked for resource: ${resource.id}`);
       }
     } catch (error) {
-      console.error('Error tracking view:', error);
+      // Don't let tracking errors impact the user experience
+      console.warn('Error tracking view (non-critical):', error);
     }
   };
   
-  // Toggle favorite
-  const toggleFavorite = async (e) => {
+  // Handle favorite toggle
+  const handleFavorite = async (e) => {
     e.preventDefault();
     e.stopPropagation();
     
-    if (!user) {
-      toast(t('auth.signInRequired'), { icon: '🔒' });
-      return;
-    }
+    if (isLoading || !user) return;
     
     setIsLoading(true);
     
+    // Optimistic update
+    setIsFavorited(prev => !prev);
+    
     try {
       if (isFavorited) {
-        // Remove from favorites
+        // Remove favorite
         const { error } = await supabase
           .from('favorites')
           .delete()
@@ -151,36 +203,24 @@ export default function ResourceCard({ resource, delay = 0 }) {
           .eq('resource_id', resource.id);
           
         if (error) throw error;
-        
-        setIsFavorited(false);
-        toast(t('resource.removedFromFavorites'), { icon: '💔' });
       } else {
-        // Add to favorites
+        // Add favorite
         const { error } = await supabase
           .from('favorites')
-          .insert([
-            { user_id: user.id, resource_id: resource.id }
-          ], { 
-            headers: { 
-              'Content-Type': 'application/json',
-              'Accept': 'application/json' 
-            }
+          .insert({
+            user_id: user.id,
+            resource_id: resource.id
           });
           
         if (error) throw error;
-        
-        setIsFavorited(true);
-        toast(t('resource.addedToFavorites'), { icon: '❤️' });
       }
-    } catch (error) {
-      console.error('Error toggling favorite:', error);
+    } catch (err) {
+      console.error('Error toggling favorite:', err);
       
-      // Check for content type error and provide more specific message
-      if (error?.code === 'PGRST102' && error?.message?.includes('Content-Type')) {
-        toast.error(t('common.apiFormatError', 'API format error. Please try again.'));
-      } else {
-        toast.error(t('common.error'));
-      }
+      // Revert optimistic update on error
+      setIsFavorited(prev => !prev);
+      
+      toast.error('Failed to update favorite status');
     } finally {
       setIsLoading(false);
     }
@@ -283,31 +323,6 @@ export default function ResourceCard({ resource, delay = 0 }) {
     }
   };
   
-  // Fetch website thumbnail and favicon when component mounts
-  useEffect(() => {
-    if (!resource.image_url && resource.url) {
-      // Get website thumbnail
-      try {
-        const thumbnail = getWebsiteThumbnail(resource.url, { size: 'medium' });
-        if (thumbnail) {
-          setThumbnailUrl(thumbnail);
-        }
-      } catch (error) {
-        console.error('Error getting website thumbnail:', error);
-      }
-      
-      // Get website favicon
-      try {
-        const favicon = getWebsiteFavicon(resource.url);
-        if (favicon) {
-          setFaviconUrl(favicon);
-        }
-      } catch (error) {
-        console.error('Error getting website favicon:', error);
-      }
-    }
-  }, [resource.url, resource.image_url, resource.id]);
-  
   return (
     <>
       <div 
@@ -354,7 +369,7 @@ export default function ResourceCard({ resource, delay = 0 }) {
               {/* Actions */}
               <div className="absolute top-2 right-2 flex space-x-1">
                 <button 
-                  onClick={toggleFavorite}
+                  onClick={handleFavorite}
                   disabled={isLoading}
                   className="p-1.5 rounded-full bg-dark-100/70 backdrop-blur-sm text-white/80 hover:text-lime-accent transition-colors duration-200"
                   aria-label={t(isFavorited ? 'resource.removeFavorite' : 'resource.addFavorite')}
@@ -397,28 +412,46 @@ export default function ResourceCard({ resource, delay = 0 }) {
               </p>
               
               {/* Tags */}
-              {resource.tags && resource.tags.length > 0 && (
+              {resource.tags && (
                 <div className="mt-3 flex flex-wrap gap-1">
-                  {resource.tags.slice(0, 3).map((tag, index) => {
-                    // Check if tag has a translation
-                    const translatedTag = t(`tags.${tag.toLowerCase()}`, tag);
+                  {(() => {
+                    // Normalize tags to always be an array
+                    let tagsArray = [];
                     
-                    return (
-                      <button 
-                        key={index} 
-                        className="tag hover:bg-glass-200 transition-colors"
-                        onClick={(e) => handleTagClick(e, tag)}
-                      >
-                        {tag.includes(':') ? (
-                          <SoftwareIcon name={tag.split(':')[1]} className="mr-1" />
-                        ) : null}
-                        {tag.includes(':') ? tag.split(':')[1] : translatedTag}
-                      </button>
-                    );
-                  })}
-                  {resource.tags.length > 3 && (
-                    <span className="tag">+{resource.tags.length - 3}</span>
-                  )}
+                    if (Array.isArray(resource.tags)) {
+                      tagsArray = resource.tags;
+                    } else if (typeof resource.tags === 'string') {
+                      tagsArray = resource.tags.split(',').map(tag => tag.trim()).filter(Boolean);
+                    }
+                    
+                    // Only show first 3 tags
+                    const visibleTags = tagsArray.slice(0, 3).map((tag, index) => {
+                      // Check if tag has a translation
+                      const translatedTag = t(`tags.${tag.toLowerCase()}`, tag);
+                      
+                      return (
+                        <button 
+                          key={index} 
+                          className="tag hover:bg-glass-200 transition-colors"
+                          onClick={(e) => handleTagClick(e, tag)}
+                        >
+                          {tag.includes(':') ? (
+                            <SoftwareIcon name={tag.split(':')[1]} className="mr-1" />
+                          ) : null}
+                          {tag.includes(':') ? tag.split(':')[1] : translatedTag}
+                        </button>
+                      );
+                    });
+                    
+                    // Add the +X indicator if there are more than 3 tags
+                    if (tagsArray.length > 3) {
+                      visibleTags.push(
+                        <span key="more" className="tag">+{tagsArray.length - 3}</span>
+                      );
+                    }
+                    
+                    return visibleTags;
+                  })()}
                 </div>
               )}
               

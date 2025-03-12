@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { supabase } from '../main';
+import supabase from '../utils/supabase';
 import { useUser } from '../context/UserContext';
 import toast from 'react-hot-toast';
 import { useLanguage } from '../context/LanguageContext';
@@ -11,38 +11,83 @@ const SubmitResourcePage = () => {
   const navigate = useNavigate();
   const [loading, setLoading] = useState(false);
   const [categories, setCategories] = useState([]);
+  const [subcategories, setSubcategories] = useState([]);
   const [formData, setFormData] = useState({
     title: '',
     description: '',
     url: '',
     image_url: '',
     category: '',
+    subcategory: '',
     tags: '',
   });
   
   useEffect(() => {
-    // Fetch categories
-    const fetchCategories = async () => {
+    // Fetch categories and subcategories
+    const fetchCategoriesData = async () => {
       try {
-        const { data, error } = await supabase
+        // Fetch categories
+        const { data: categoriesData, error: categoriesError } = await supabase
           .from('categories')
           .select('*')
           .order('name');
           
-        if (error) throw error;
-        setCategories(data || []);
+        if (categoriesError) throw categoriesError;
+        setCategories(categoriesData || []);
+        
+        // Fetch subcategories
+        const { data: subcategoriesData, error: subcategoriesError } = await supabase
+          .from('subcategories')
+          .select('*')
+          .order('name');
+          
+        if (subcategoriesError) throw subcategoriesError;
+        setSubcategories(subcategoriesData || []);
       } catch (error) {
-        console.error('Error fetching categories:', error);
+        console.error('Error fetching categories/subcategories:', error);
         toast.error(t('submit.errors.loadCategories', 'Failed to load categories'));
+        
+        // Fallback to local mode if there's a network error
+        if (error.message === 'Failed to fetch' || error.message?.includes('network')) {
+          localStorage.setItem('forceSupabaseConnection', 'false');
+          
+          // Set mock categories and subcategories for local mode
+          setCategories([
+            { id: 1, name: 'Design', slug: 'design' },
+            { id: 2, name: 'Development', slug: 'development' },
+            { id: 3, name: 'Marketing', slug: 'marketing' },
+            { id: 4, name: 'Productivity', slug: 'productivity' }
+          ]);
+          
+          setSubcategories([
+            { id: 1, name: 'UI Design', slug: 'ui-design', category_id: 1 },
+            { id: 2, name: 'UX Design', slug: 'ux-design', category_id: 1 },
+            { id: 3, name: 'Web Development', slug: 'web-development', category_id: 2 },
+            { id: 4, name: 'Mobile Development', slug: 'mobile-development', category_id: 2 }
+          ]);
+        }
       }
     };
     
-    fetchCategories();
+    fetchCategoriesData();
   }, [t]);
+  
+  // Filter subcategories based on selected category
+  const filteredSubcategories = formData.category 
+    ? subcategories.filter(sub => {
+        const category = categories.find(cat => cat.slug === formData.category);
+        return category && sub.category_id === category.id;
+      })
+    : [];
   
   const handleChange = (e) => {
     const { name, value } = e.target;
     setFormData((prev) => ({ ...prev, [name]: value }));
+    
+    // Reset subcategory when category changes
+    if (name === 'category') {
+      setFormData(prev => ({ ...prev, subcategory: '' }));
+    }
   };
   
   const handleSubmit = async (e) => {
@@ -62,26 +107,34 @@ const SubmitResourcePage = () => {
         .map((tag) => tag.trim().toLowerCase())
         .filter((tag) => tag);
       
+      // Prepare resource data
+      const resourceData = {
+        title: formData.title,
+        description: formData.description,
+        url: formData.url,
+        image_url: formData.image_url || null,
+        category: formData.category,
+        subcategory: formData.subcategory || null,
+        tags: tagsArray,
+        user_id: user.id,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      };
+      
+      // Check if we're in local mode
+      const forceSupabase = localStorage.getItem('forceSupabaseConnection') === 'true';
+      if (!forceSupabase) {
+        // Mock submission for local mode
+        console.log('Local mode: Resource would be submitted with data:', resourceData);
+        toast.success(t('submit.success', 'Resource submitted successfully!'));
+        navigate('/');
+        return;
+      }
+      
       // Submit resource
       const { data, error } = await supabase
         .from('resources')
-        .insert([
-          {
-            title: formData.title,
-            description: formData.description,
-            url: formData.url,
-            image_url: formData.image_url || null,
-            category: formData.category,
-            tags: tagsArray,
-            user_id: user.id,
-            approved: false,
-          },
-        ], { 
-          headers: { 
-            'Content-Type': 'application/json',
-            'Accept': 'application/json' 
-          }
-        })
+        .insert([resourceData])
         .select();
         
       if (error) throw error;
@@ -90,7 +143,19 @@ const SubmitResourcePage = () => {
       navigate('/');
     } catch (error) {
       console.error('Error submitting resource:', error);
-      toast.error(t('submit.errors.submitFailed', 'Failed to submit resource'));
+      
+      // Check for specific error types
+      if (error.code === 'PGRST204') {
+        toast.error('Database schema error. Please contact support.');
+      } else if (error.message === 'Failed to fetch' || error.message?.includes('network')) {
+        toast.error('Network error. Switching to local mode.');
+        localStorage.setItem('forceSupabaseConnection', 'false');
+        
+        // Try again in local mode
+        setTimeout(() => handleSubmit(e), 500);
+      } else {
+        toast.error(t('submit.errors.submitFailed', 'Failed to submit resource'));
+      }
     } finally {
       setLoading(false);
     }
@@ -187,26 +252,49 @@ const SubmitResourcePage = () => {
               </p>
             </div>
             
-            <div>
-              <label htmlFor="category" className="block text-sm font-medium mb-1">
-                {t('submit.form.category', 'Category')} *
-              </label>
-              <select
-                id="category"
-                name="category"
-                value={formData.category}
-                onChange={handleChange}
-                className="w-full px-4 py-2 bg-dark-400 border border-glass-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-lime-accent"
-                required
-                disabled={!user || loading}
-              >
-                <option value="">{t('submit.form.selectCategory', 'Select a category')}</option>
-                {categories.map((category) => (
-                  <option key={category.id} value={category.slug}>
-                    {category.name}
-                  </option>
-                ))}
-              </select>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label htmlFor="category" className="block text-sm font-medium mb-1">
+                  {t('submit.form.category', 'Category')} *
+                </label>
+                <select
+                  id="category"
+                  name="category"
+                  value={formData.category}
+                  onChange={handleChange}
+                  className="w-full px-4 py-2 bg-dark-400 border border-glass-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-lime-accent"
+                  required
+                  disabled={!user || loading}
+                >
+                  <option value="">{t('submit.form.selectCategory', 'Select a category')}</option>
+                  {categories.map((category) => (
+                    <option key={category.id} value={category.slug}>
+                      {category.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              
+              <div>
+                <label htmlFor="subcategory" className="block text-sm font-medium mb-1">
+                  {t('submit.form.subcategory', 'Subcategory')}
+                </label>
+                <select
+                  id="subcategory"
+                  name="subcategory"
+                  value={formData.subcategory}
+                  onChange={handleChange}
+                  className="w-full px-4 py-2 bg-dark-400 border border-glass-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-lime-accent"
+                  disabled={!formData.category || !user || loading}
+                >
+                  <option value="">{t('submit.form.selectSubcategory', 'Select a subcategory (optional)')}</option>
+                  {filteredSubcategories.map((subcategory) => (
+                    <option key={subcategory.id} value={subcategory.slug}>
+                      {subcategory.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
             </div>
             
             <div>

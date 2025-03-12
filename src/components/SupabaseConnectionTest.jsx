@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { supabase } from '../main';
+import supabase, { checkSupabaseConnection } from '../utils/supabase';
 
 const SupabaseConnectionTest = () => {
   const [connectionStatus, setConnectionStatus] = useState('checking');
@@ -33,79 +33,6 @@ const SupabaseConnectionTest = () => {
           return;
         }
         
-        // Handle MCP server separately
-        if (supabaseUrl.includes('mcp-supabase-server')) {
-          console.log('Using MCP Supabase server');
-          
-          // First try with a short timeout to test if the server is responsive
-          try {
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 5000);
-            
-            const response = await fetch(`${supabaseUrl}/ping`, {
-              method: 'GET',
-              signal: controller.signal,
-              headers: {
-                'Content-Type': 'application/json'
-              }
-            });
-            
-            clearTimeout(timeoutId);
-            
-            if (!response.ok) {
-              throw new Error(`MCP server responded with status: ${response.status}`);
-            }
-            
-            console.log('MCP server is responsive');
-          } catch (pingError) {
-            console.error('MCP server ping failed:', pingError);
-            setConnectionStatus('failed');
-            setError(`Cannot connect to MCP server: ${pingError.message}. The server might be down or unreachable.`);
-            return;
-          }
-          
-          // Try a simple query that should work with MCP server
-          const { data, error } = await supabase
-            .from('resources')
-            .select('*')
-            .limit(1);
-          
-          if (error) throw error;
-          
-          console.log('MCP server connection successful:', data);
-          setConnectionStatus('connected');
-          
-          // Fetch resources for display
-          const { data: resourcesData, error: resourcesError } = await supabase
-            .from('resources')
-            .select('*')
-            .limit(5);
-            
-          if (resourcesError) throw resourcesError;
-          setResources(resourcesData || []);
-          
-          // Get statistics
-          const { data: allResources, error: statsError } = await supabase
-            .from('resources')
-            .select('category, subcategory');
-            
-          if (statsError) throw statsError;
-          
-          // Calculate stats
-          const totalCount = allResources.length;
-          const categories = [...new Set(allResources.map(r => r.category))];
-          const subcategories = [...new Set(allResources.map(r => r.subcategory))];
-          
-          setStats({
-            totalResources: totalCount,
-            categories,
-            subcategories
-          });
-          
-          return;
-        }
-        
-        // Standard connection test (non-MCP)
         // Test connection by fetching a single resource
         const { data, error } = await supabase
           .from('resources')

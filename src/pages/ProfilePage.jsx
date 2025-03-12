@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
-import { supabase } from '../main';
+import supabase from '../utils/supabase';
 import { useUser } from '../context/UserContext';
 import { getAvatarUrl } from '../utils/avatarUtils';
 import { PencilIcon } from '@heroicons/react/outline';

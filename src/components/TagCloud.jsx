@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { supabase } from '../main';
+import supabase from '../utils/supabase';
 import { useLanguage } from '../context/LanguageContext';
 
 export default function TagCloud({ tags: propTags, selectedTags, onTagClick }) {

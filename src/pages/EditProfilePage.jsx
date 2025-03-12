@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useMemo } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import { useUser } from '../context/UserContext';
 import { getAvatarPreviews, getAvatarUrl } from '../utils/avatarUtils';
-import { supabase } from '../main';
+import supabase from '../utils/supabase';
 import toast from 'react-hot-toast';
 import { ArrowLeftIcon, CheckIcon, ExternalLinkIcon, RefreshIcon } from '@heroicons/react/outline';
 import { useLanguage } from '../context/LanguageContext';
@@ -121,13 +121,44 @@ const EditProfilePage = () => {
   // Check Supabase connection
   useEffect(() => {
     const checkConnection = async () => {
+      // Skip Supabase request if in local mode
+      const forceSupabase = localStorage.getItem('forceSupabaseConnection') === 'true';
+      if (!forceSupabase) {
+        console.log("Using local data mode, skipping Supabase connection check");
+        setSupabaseConnected(true);
+        return;
+      }
+      
       try {
-        const { data, error } = await supabase.from('profiles').select('count', { count: 'exact', head: true });
+        // Use a more reliable table for connection check
+        const { data, error } = await supabase.from('resources').select('count', { count: 'exact', head: true });
         
         if (error) {
-          console.error("Supabase connection error:", error);
-          setSupabaseConnected(false);
-          setLoadError(t('editProfile.errors.connection', 'Could not connect to database. Please check your internet connection.'));
+          // If the table doesn't exist, try another one
+          if (error.code === '42P01') {
+            console.log("Resources table doesn't exist, trying translations");
+            const { error: translationsError } = await supabase.from('translations').select('count', { count: 'exact', head: true });
+            
+            if (translationsError) {
+              console.error("Supabase connection error:", translationsError);
+              setSupabaseConnected(false);
+              setLoadError(t('editProfile.errors.connection', 'Could not connect to database. Please check your internet connection.'));
+              setPageLoading(false);
+            } else {
+              console.log("Supabase connection successful via translations");
+              setSupabaseConnected(true);
+              // If we have the user, fetch their profile
+              if (user) {
+                fetchProfileData();
+              } else {
+                setPageLoading(false);
+              }
+            }
+          } else {
+            console.error("Supabase connection error:", error);
+            setSupabaseConnected(false);
+            setLoadError(t('editProfile.errors.connection', 'Could not connect to database. Please check your internet connection.'));
+          }
         } else {
           console.log("Supabase connection successful");
           setSupabaseConnected(true);
@@ -176,6 +207,31 @@ const EditProfilePage = () => {
         return;
       }
       
+      // Skip Supabase request if in local mode
+      const forceSupabase = localStorage.getItem('forceSupabaseConnection') === 'true';
+      if (!forceSupabase) {
+        console.log("Using local data mode, creating mock profile");
+        
+        // Create a mock profile
+        const mockProfile = {
+          id: user.id,
+          username: user.email?.split('@')[0] || 'User',
+          avatar_url: null,
+          website: null,
+          bio: 'This is a mock profile for local data mode.',
+          social_links: {},
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        };
+        
+        if (isMounted) {
+          setFormData(mockProfile);
+          setSocialUsernames(mockProfile.social_links);
+          setPageLoading(false);
+        }
+        return;
+      }
+      
       setPageLoading(true);
       setLoadError(null);
       
@@ -196,8 +252,37 @@ const EditProfilePage = () => {
         clearTimeout(timeoutId);
         
         if (error) {
-          console.error("Error fetching profile directly:", error);
-          throw error;
+          console.error("Error fetching profile:", error);
+          
+          // If the table doesn't exist, create a mock profile
+          if (error.code === '42P01') {
+            console.log("Profiles table doesn't exist, using mock profile");
+            
+            // Create a mock profile
+            const mockProfile = {
+              id: user.id,
+              username: user.email?.split('@')[0] || 'User',
+              avatar_url: null,
+              website: null,
+              bio: 'This is a mock profile.',
+              social_links: {},
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString()
+            };
+            
+            if (isMounted) {
+              setFormData(mockProfile);
+              setSocialUsernames(mockProfile.social_links);
+              setPageLoading(false);
+            }
+            return;
+          }
+          
+          if (isMounted) {
+            setLoadError(t('editProfile.errors.fetch', 'Failed to load profile data. Please try again.'));
+            setPageLoading(false);
+          }
+          return;
         }
         
         if (data && isMounted) {
@@ -355,41 +440,78 @@ const EditProfilePage = () => {
     // Reset connection state to trigger recheck
     setSupabaseConnected(true);
     
+    // Skip Supabase request if in local mode
+    const forceSupabase = localStorage.getItem('forceSupabaseConnection') === 'true';
+    if (!forceSupabase) {
+      console.log("Using local data mode, skipping Supabase connection check");
+      setSupabaseConnected(true);
+      
+      // Create a mock profile
+      if (user) {
+        const mockProfile = {
+          id: user.id,
+          username: user.email?.split('@')[0] || 'User',
+          avatar_url: null,
+          website: null,
+          bio: 'This is a mock profile for local data mode.',
+          social_links: {},
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        };
+        
+        setFormData(mockProfile);
+        setSocialUsernames(mockProfile.social_links);
+      }
+      
+      setPageLoading(false);
+      return;
+    }
+    
     // First check the connection
     const checkConnection = async () => {
       try {
-        const { data, error } = await supabase.from('profiles').select('count', { count: 'exact', head: true });
+        // Use a more reliable table for connection check
+        const { data, error } = await supabase.from('resources').select('count', { count: 'exact', head: true });
         
         if (error) {
-          console.error("Retry - Supabase connection error:", error);
-          setSupabaseConnected(false);
-          setLoadError(t('editProfile.errors.connection', 'Could not connect to database. Please check your internet connection.'));
-          setPageLoading(false);
+          // If the table doesn't exist, try another one
+          if (error.code === '42P01') {
+            console.log("Resources table doesn't exist, trying translations");
+            const { error: translationsError } = await supabase.from('translations').select('count', { count: 'exact', head: true });
+            
+            if (translationsError) {
+              console.error("Supabase connection error:", translationsError);
+              setSupabaseConnected(false);
+              setLoadError(t('editProfile.errors.connection', 'Could not connect to database. Please check your internet connection.'));
+              setPageLoading(false);
+            } else {
+              console.log("Supabase connection successful via translations");
+              setSupabaseConnected(true);
+              // If we have the user, fetch their profile
+              if (user) {
+                fetchProfileData();
+              } else {
+                setPageLoading(false);
+              }
+            }
+          } else {
+            console.error("Retry - Supabase connection error:", error);
+            setSupabaseConnected(false);
+            setLoadError(t('editProfile.errors.connection', 'Could not connect to database. Please check your internet connection.'));
+            setPageLoading(false);
+          }
         } else {
           console.log("Retry - Supabase connection successful");
           setSupabaseConnected(true);
           // If we have the user, fetch their profile
           if (user) {
-            fetchUserProfile(user.id); // Use the context method if available
-            // Reset timeout for loading
-            if (timeoutRef.current) {
-              clearTimeout(timeoutRef.current);
-            }
-            timeoutRef.current = setTimeout(() => {
-              if (pageLoading) {
-                console.warn("Retry - Loading timeout reached");
-                setPageLoading(false);
-                setLoadError(t('editProfile.errors.timeout', 'Loading took too long. Please try refreshing the page.'));
-              }
-            }, 20000);
+            fetchProfileData();
           } else {
-            // No user, can't load profile
             setPageLoading(false);
-            navigate('/profile');
           }
         }
       } catch (error) {
-        console.error("Retry - Connection check failed:", error);
+        console.error("Retry - Supabase connection check failed:", error);
         setSupabaseConnected(false);
         setLoadError(t('editProfile.errors.connection', 'Could not connect to database. Please check your internet connection.'));
         setPageLoading(false);

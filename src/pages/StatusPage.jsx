@@ -1,8 +1,9 @@
-import { useState, useEffect } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
-import { supabase, checkSupabaseConnection } from '../main';
+import supabase, { checkSupabaseConnection } from '../utils/supabase';
 import { ArrowLeftIcon, RefreshIcon, ServerIcon, DatabaseIcon, CheckCircleIcon, XCircleIcon, ExclamationIcon } from '@heroicons/react/outline';
 import { useLanguage } from "../context/LanguageContext";
+import { toast } from 'react-hot-toast';
 
 const StatusPage = () => {
   const { t } = useLanguage();
@@ -49,46 +50,74 @@ const StatusPage = () => {
   const checkSupabaseStatus = async () => {
     setLoading(true);
     
+    // Check if Supabase URL is configured
+    const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+    if (!supabaseUrl) {
+      setSupabaseStatus({
+        status: 'error',
+        error: 'Supabase URL not configured. Please set VITE_SUPABASE_URL in your environment variables.',
+        responseTime: 0,
+        tables: [],
+        lastChecked: new Date()
+      });
+      setLoading(false);
+      return;
+    }
+    
     try {
       const startTime = performance.now();
       
-      // Use the improved connection check function from main.jsx
-      const connectionResult = await checkSupabaseConnection();
+      // Use the improved connection check function from utils/supabase.js
+      const isConnected = await checkSupabaseConnection(true); // Force a fresh check
       
-      if (connectionResult && connectionResult.success) {
+      if (isConnected) {
         console.log('Supabase connection successful');
         
-        // Check what tables we can access
-        const tables = [];
+        // Check what tables we can access - but only if we haven't checked recently
+        // to avoid excessive database queries
+        const cachedTablesCheck = localStorage.getItem('supabaseTablesCheck');
+        const cachedTablesTime = localStorage.getItem('supabaseTablesTime');
+        const now = Date.now();
         
-        // Try to access known tables
-        const tableChecks = await Promise.allSettled([
-          supabase.from('profiles').select('count', { count: 'exact', head: true }),
-          supabase.from('resources').select('count', { count: 'exact', head: true }),
-          supabase.from('translations').select('count', { count: 'exact', head: true }),
-          supabase.from('health_check').select('count', { count: 'exact', head: true })
-        ]);
+        let tables = [];
         
-        // Process results
-        const tableNames = ['profiles', 'resources', 'translations', 'health_check'];
-        tableChecks.forEach((result, index) => {
-          const tableName = tableNames[index];
-          if (result.status === 'fulfilled') {
-            const { data, error } = result.value;
-            if (error) {
-              if (error.code === '42P01') {
-                tables.push({ name: tableName, rows: '0', status: 'not created' });
+        // Use cached table data if it's less than 5 minutes old
+        if (cachedTablesCheck && cachedTablesTime && 
+            (now - parseInt(cachedTablesTime)) < 5 * 60 * 1000) {
+          console.log('Using cached tables data');
+          tables = JSON.parse(cachedTablesCheck);
+        } else {
+          // Try to access known tables
+          const tableChecks = await Promise.allSettled([
+            supabase.from('resources').select('count', { count: 'exact', head: true }),
+            supabase.from('translations').select('count', { count: 'exact', head: true })
+          ]);
+          
+          // Process results
+          const tableNames = ['resources', 'translations'];
+          tableChecks.forEach((result, index) => {
+            const tableName = tableNames[index];
+            if (result.status === 'fulfilled') {
+              const { data, error } = result.value;
+              if (error) {
+                if (error.code === '42P01') {
+                  tables.push({ name: tableName, rows: '0', status: 'not created' });
+                } else {
+                  tables.push({ name: tableName, rows: '?', status: 'error', error: error.message });
+                }
               } else {
-                tables.push({ name: tableName, rows: '?', status: 'error', error: error.message });
+                const rowCount = data && data.count !== undefined ? data.count : '?';
+                tables.push({ name: tableName, rows: rowCount, status: 'accessible' });
               }
             } else {
-              const rowCount = data && data.count !== undefined ? data.count : '?';
-              tables.push({ name: tableName, rows: rowCount, status: 'accessible' });
+              tables.push({ name: tableName, rows: '?', status: 'error', error: result.reason.message });
             }
-          } else {
-            tables.push({ name: tableName, rows: '?', status: 'error', error: result.reason.message });
-          }
-        });
+          });
+          
+          // Cache the tables data
+          localStorage.setItem('supabaseTablesCheck', JSON.stringify(tables));
+          localStorage.setItem('supabaseTablesTime', now.toString());
+        }
         
         const endTime = performance.now();
         const responseTime = endTime - startTime;
@@ -101,14 +130,14 @@ const StatusPage = () => {
           lastChecked: new Date()
         });
       } else {
-        console.error('Supabase connection failed:', connectionResult?.error);
+        console.log('Supabase connection failed');
         
         const endTime = performance.now();
         const responseTime = endTime - startTime;
         
         setSupabaseStatus({
           status: 'offline',
-          error: connectionResult?.error?.message || t('status.errors.connectionFailed', 'Connection failed'),
+          error: t('status.errors.connectionFailed', 'Connection failed'),
           responseTime: Math.round(responseTime),
           tables: [],
           lastChecked: new Date()
@@ -116,10 +145,11 @@ const StatusPage = () => {
       }
     } catch (error) {
       console.error('Error checking Supabase status:', error);
+      
       setSupabaseStatus({
         status: 'error',
-        error: error.message || t('status.errors.connectionFailed', 'Connection failed'),
-        responseTime: null,
+        error: error.message || t('status.errors.unknown', 'Unknown error'),
+        responseTime: 0,
         tables: [],
         lastChecked: new Date()
       });
@@ -131,8 +161,23 @@ const StatusPage = () => {
   // Run checks on component mount
   useEffect(() => {
     const runChecks = async () => {
-      checkServerStatus();
-      await checkSupabaseStatus();
+      // Check if Supabase connection is forced
+      const forceSupabase = localStorage.getItem('forceSupabaseConnection') === 'true';
+      
+      // Only run automatic checks if Supabase is forced
+      if (forceSupabase) {
+        checkServerStatus();
+        await checkSupabaseStatus();
+      } else {
+        // Set default values without making any requests
+        setSupabaseStatus({
+          status: 'disabled',
+          error: 'Connection checks disabled for performance. Enable Supabase mode to check.',
+          responseTime: null,
+          tables: [],
+          lastChecked: new Date()
+        });
+      }
     };
     
     runChecks();
@@ -149,6 +194,36 @@ const StatusPage = () => {
     await checkSupabaseStatus();
   };
   
+  // Toggle Supabase connection mode
+  const toggleSupabaseMode = () => {
+    const currentMode = localStorage.getItem('forceSupabaseConnection') === 'true';
+    const newMode = !currentMode;
+    
+    localStorage.setItem('forceSupabaseConnection', newMode.toString());
+    
+    if (newMode) {
+      toast.success('Supabase mode enabled. The app will use live data.', {
+        duration: 3000,
+        icon: '🚀'
+      });
+      refreshStatus();
+    } else {
+      toast.success('Local data mode enabled. Connection checks disabled for performance.', {
+        duration: 3000,
+        icon: '⚡'
+      });
+      
+      // Update status without making requests
+      setSupabaseStatus({
+        status: 'disabled',
+        error: 'Connection checks disabled for performance. Enable Supabase mode to check.',
+        responseTime: null,
+        tables: [],
+        lastChecked: new Date()
+      });
+    }
+  };
+  
   return (
     <div className="container mx-auto px-4 py-8">
       <div className="max-w-4xl mx-auto">
@@ -159,14 +234,36 @@ const StatusPage = () => {
           </Link>
           <h1 className="text-2xl font-bold">{t('status.title', 'System Status')}</h1>
           
-          <button 
-            onClick={refreshStatus} 
-            disabled={loading}
-            className="ml-auto flex items-center px-4 py-2 bg-dark-300 rounded-md hover:bg-dark-400 transition-colors"
-          >
-            <RefreshIcon className={`w-4 h-4 mr-2 ${loading ? 'animate-spin' : ''}`} />
-            {t('common.refresh', 'Refresh')}
-          </button>
+          <div className="ml-auto flex items-center space-x-2">
+            <button 
+              onClick={toggleSupabaseMode}
+              className={`flex items-center px-4 py-2 rounded-md transition-colors ${
+                localStorage.getItem('forceSupabaseConnection') === 'true'
+                  ? 'bg-lime-accent/20 text-lime-accent hover:bg-lime-accent/30'
+                  : 'bg-dark-300 text-white/70 hover:bg-dark-400'
+              }`}
+            >
+              <span className="mr-2">
+                {localStorage.getItem('forceSupabaseConnection') === 'true'
+                  ? 'Using Supabase'
+                  : 'Using Local Data'}
+              </span>
+              <span className={`w-3 h-3 rounded-full ${
+                localStorage.getItem('forceSupabaseConnection') === 'true'
+                  ? 'bg-lime-accent'
+                  : 'bg-white/30'
+              }`}></span>
+            </button>
+            
+            <button 
+              onClick={refreshStatus} 
+              disabled={loading || supabaseStatus.status === 'disabled'}
+              className="flex items-center px-4 py-2 bg-dark-300 rounded-md hover:bg-dark-400 transition-colors disabled:opacity-50"
+            >
+              <RefreshIcon className={`w-4 h-4 mr-2 ${loading ? 'animate-spin' : ''}`} />
+              {t('common.refresh', 'Refresh')}
+            </button>
+          </div>
         </div>
         
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8">
